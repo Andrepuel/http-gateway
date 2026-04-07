@@ -1,5 +1,6 @@
 use crate::handler::{Handler, Request, Response, StringId};
 use either::Either;
+use futures::FutureExt;
 use hyper::{Method, StatusCode};
 
 pub struct RouterHandler<R> {
@@ -60,6 +61,26 @@ where
                                     let route = f(root, &mut req, path).await;
 
                                     RouterHandler::<U>::do_handle(route, req).await
+                                },
+                            )
+                            .await;
+                    }
+
+                    async fn route_if_recursive<I, F, U>(&mut self, if_: I, f: F)
+                    where
+                        I: FnOnce(&StringId) -> bool,
+                        F: AsyncFnOnce(R, &mut Request, StringId) -> U,
+                        U: MakeRoute,
+                    {
+                        self.0
+                            .execute_if(
+                                |(req_path, _, _)| if_(req_path),
+                                async |(path, root, mut req)| {
+                                    let route = f(root, &mut req, path).await;
+
+                                    RouterHandler::<U>::do_handle(route, req)
+                                        .boxed_local()
+                                        .await
                                 },
                             )
                             .await;
@@ -172,6 +193,18 @@ pub trait Router<T> {
         )
     }
 
+    fn path_recursive<F, U, P>(&mut self, path: P, f: F) -> impl Future<Output = ()>
+    where
+        F: AsyncFnOnce(T, &mut Request) -> U,
+        U: MakeRoute,
+        P: Into<StringId>,
+    {
+        self.route_if_recursive(
+            |req_path| req_path == &path.into(),
+            async |a1, a2, _a3| f(a1, a2).await,
+        )
+    }
+
     fn route<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, &mut Request, StringId) -> U,
@@ -180,7 +213,25 @@ pub trait Router<T> {
         self.route_if(|_| true, f)
     }
 
+    fn route_recursive<F, U>(&mut self, f: F) -> impl Future<Output = ()>
+    where
+        F: AsyncFnOnce(T, &mut Request, StringId) -> U,
+        U: MakeRoute,
+    {
+        self.route_if_recursive(|_| true, f)
+    }
+
     fn route_if<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
+    where
+        I: FnOnce(&StringId) -> bool,
+        F: AsyncFnOnce(T, &mut Request, StringId) -> U,
+        U: MakeRoute,
+    {
+        let _ = (if_, f);
+        async move {}
+    }
+
+    fn route_if_recursive<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
     where
         I: FnOnce(&StringId) -> bool,
         F: AsyncFnOnce(T, &mut Request, StringId) -> U,
@@ -279,6 +330,20 @@ where
                         None => None,
                     })
                     .await;
+            }
+
+            async fn route_if_recursive<I, F, U>(&mut self, if_: I, f: F)
+            where
+                I: FnOnce(&StringId) -> bool,
+                F: AsyncFnOnce(T, &mut Request, StringId) -> U,
+                U: MakeRoute,
+            {
+                self.0
+                    .route_if_recursive(if_, async |self_, req, path| match self_ {
+                        Some(self_) => Some(f(self_, req, path).await),
+                        None => None,
+                    })
+                    .await
             }
 
             async fn any_leaf<F, U>(&mut self, f: F)
