@@ -1,6 +1,5 @@
 use crate::handler::{Handler, Request, Response, StringId};
 use either::Either;
-use futures::FutureExt;
 use hyper::{Method, StatusCode};
 
 pub struct RouterHandler<R> {
@@ -30,9 +29,7 @@ where
                     .execute(async |(root, mut req)| {
                         let route = f(root, &mut req).await;
 
-                        RouterHandler::<U>::do_handle(route, req)
-                            .boxed_local()
-                            .await
+                        RouterHandler::<U>::do_handle(route, req).await
                     })
                     .await;
             }
@@ -62,9 +59,7 @@ where
                                 async |(path, root, mut req)| {
                                     let route = f(root, &mut req, path).await;
 
-                                    RouterHandler::<U>::do_handle(route, req)
-                                        .boxed_local()
-                                        .await
+                                    RouterHandler::<U>::do_handle(route, req).await
                                 },
                             )
                             .await;
@@ -316,6 +311,9 @@ where
             T::register(&mut OptRouter(router)).await;
         }
     }
+}
+impl MakeRoute for () {
+    async fn register<R: Router<Self>>(_router: &mut R) {}
 }
 
 pub struct RouterResponse {

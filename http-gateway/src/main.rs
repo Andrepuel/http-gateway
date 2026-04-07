@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 pub mod handler;
 pub mod router;
 pub mod tokio_hyper;
@@ -55,7 +57,7 @@ impl MakeRoute for AuthRouter {
                     .remove(&"authorization".into())
                     .map(Authorization::from);
 
-                Some(EchoRouter {
+                Some(EchoRouter::<5> {
                     auth,
                     path: Default::default(),
                 })
@@ -65,17 +67,21 @@ impl MakeRoute for AuthRouter {
 }
 
 #[derive(Clone)]
-struct EchoRouter {
+struct EchoRouter<const N: isize> {
     auth: Option<Authorization>,
     path: Vec<StringId>,
 }
-impl EchoRouter {}
-impl MakeRoute for EchoRouter {
+
+impl<const N: isize> MakeRoute for EchoRouter<N>
+where
+    Self: RecursionCountdown,
+{
     async fn register<R: router::Router<Self>>(router: &mut R) {
         router
             .route(async |mut self_, _req, hop| {
                 self_.path.push(hop);
-                self_
+
+                <Self as RecursionCountdown>::next(self_)
             })
             .await;
 
@@ -102,6 +108,67 @@ struct EchoResponse {
     pub headers: HashMap<StringId, String>,
     pub query: HashMap<StringId, String>,
     pub body: Option<serde_json::Value>,
+}
+
+trait RecursionCountdown {
+    type Next: MakeRoute;
+
+    fn next(self) -> Self::Next;
+}
+impl RecursionCountdown for EchoRouter<5> {
+    type Next = EchoRouter<4>;
+
+    fn next(self) -> Self::Next {
+        Self::Next {
+            auth: self.auth,
+            path: self.path,
+        }
+    }
+}
+impl RecursionCountdown for EchoRouter<4> {
+    type Next = EchoRouter<3>;
+
+    fn next(self) -> Self::Next {
+        Self::Next {
+            auth: self.auth,
+            path: self.path,
+        }
+    }
+}
+impl RecursionCountdown for EchoRouter<3> {
+    type Next = EchoRouter<2>;
+
+    fn next(self) -> Self::Next {
+        Self::Next {
+            auth: self.auth,
+            path: self.path,
+        }
+    }
+}
+impl RecursionCountdown for EchoRouter<2> {
+    type Next = EchoRouter<1>;
+
+    fn next(self) -> Self::Next {
+        Self::Next {
+            auth: self.auth,
+            path: self.path,
+        }
+    }
+}
+impl RecursionCountdown for EchoRouter<1> {
+    type Next = EchoRouter<0>;
+
+    fn next(self) -> Self::Next {
+        Self::Next {
+            auth: self.auth,
+            path: self.path,
+        }
+    }
+}
+impl RecursionCountdown for EchoRouter<0> {
+    type Next = ();
+
+    fn next(self) -> Self::Next {}
 }
 
 async fn async_main() -> io::Result<Never> {
