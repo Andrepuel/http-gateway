@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 pub mod handler;
 pub mod router;
 pub mod tokio_hyper;

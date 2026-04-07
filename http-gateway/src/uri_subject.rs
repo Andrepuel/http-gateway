@@ -11,9 +11,11 @@ pub fn uri_to_path(uri: Uri) -> VecDeque<StringId> {
         return Default::default();
     };
 
-    path_and_query
-        .path()
-        .split('/')
+    path_str_to_path(path_and_query.path())
+}
+
+pub fn path_str_to_path(path: &str) -> VecDeque<StringId> {
+    path.split('/')
         .filter_map(|path| urlencoding::decode(path).ok())
         .filter(|path| !str::is_empty(path.deref()))
         .map(|path| replace_special_chars(path.into_owned()))

@@ -2,6 +2,7 @@ use crate::handler::{Handler, Request, Response, StringId};
 use either::Either;
 use futures::FutureExt;
 use hyper::{Method, StatusCode};
+use std::any::TypeId;
 
 pub struct RouterHandler<R> {
     root: R,
@@ -100,24 +101,15 @@ where
             None => {
                 struct MakeRouteLeaf<R>(RouterState<(R, Request)>);
                 impl<R> Router<R> for MakeRouteLeaf<R> {
-                    async fn any_leaf<F, U>(&mut self, f: F)
+                    async fn leaf_if<I, F, U>(&mut self, if_: I, f: F)
                     where
-                        F: AsyncFnOnce(R, Request) -> U,
-                        U: Response,
-                    {
-                        self.0
-                            .execute(async |(root, req)| RouterResponse::new(f(root, req).await))
-                            .await;
-                    }
-
-                    async fn leaf<F, U>(&mut self, method: Method, f: F)
-                    where
+                        I: FnOnce(&Method) -> bool,
                         F: AsyncFnOnce(R, Request) -> U,
                         U: Response,
                     {
                         self.0
                             .execute_if(
-                                |(_, req)| req.method == method,
+                                |(_, req)| (if_)(&req.method),
                                 async |(root, req)| RouterResponse::new(f(root, req).await),
                             )
                             .await;
@@ -129,27 +121,42 @@ where
                 match call.0.take() {
                     Either::Right(r) => r,
                     Either::Left((_root, req)) => {
-                        struct FindOtherMethods<R>(Vec<Method>, std::marker::PhantomData<R>);
-                        impl<R> Router<R> for FindOtherMethods<R> {
-                            async fn leaf<F, U>(&mut self, method: Method, _f: F)
-                            where
-                                F: AsyncFnOnce(R, Request) -> U,
-                                U: Response,
-                            {
-                                self.0.push(method);
+                        let mut other_methods = Vec::new();
+                        for method in [
+                            Method::HEAD,
+                            Method::GET,
+                            Method::PUT,
+                            Method::POST,
+                            Method::DELETE,
+                        ] {
+                            struct FindOtherMethods(Method, bool);
+                            impl<R> Router<R> for FindOtherMethods {
+                                async fn leaf_if<I, F, U>(&mut self, if_: I, _f: F)
+                                where
+                                    I: FnOnce(&Method) -> bool,
+                                    F: AsyncFnOnce(R, Request) -> U,
+                                    U: Response,
+                                {
+                                    if (if_)(&self.0) {
+                                        self.1 = true;
+                                    }
+                                }
+                            }
+
+                            let mut check_one = FindOtherMethods(method, false);
+                            R::register(&mut check_one).await;
+                            if check_one.1 {
+                                other_methods.push(check_one.0);
                             }
                         }
-                        let mut other_method =
-                            FindOtherMethods(Default::default(), Default::default());
-                        R::register(&mut other_method).await;
 
-                        match other_method.0.is_empty() {
+                        match other_methods.is_empty() {
                             true => {
-                                tracing::debug!(method=?req.method, "Not matching route for leaf");
+                                tracing::debug!(method=?req.method, route=std::any::type_name::<R>(), "Not matching route for leaf");
                                 RouterResponse::e404()
                             }
                             false => {
-                                tracing::debug!(allowed=?other_method.0, method=?req.method, "Method not allowed");
+                                tracing::debug!(allowed=?other_methods, method=?req.method, "Method not allowed");
                                 RouterResponse::e405()
                             }
                         }
@@ -241,21 +248,29 @@ pub trait Router<T> {
         async move {}
     }
 
-    fn any_leaf<F, U>(&mut self, f: F) -> impl Future<Output = ()>
-    where
-        F: AsyncFnOnce(T, Request) -> U,
-        U: Response,
-    {
-        let _ = f;
-        async move {}
-    }
-
     fn leaf<F, U>(&mut self, method: Method, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, Request) -> U,
         U: Response,
     {
-        let _ = (method, f);
+        self.leaf_if(move |req_method| req_method == method, f)
+    }
+
+    fn any_leaf<F, U>(&mut self, f: F) -> impl Future<Output = ()>
+    where
+        F: AsyncFnOnce(T, Request) -> U,
+        U: Response,
+    {
+        self.leaf_if(|_| true, f)
+    }
+
+    fn leaf_if<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
+    where
+        I: FnOnce(&Method) -> bool,
+        F: AsyncFnOnce(T, Request) -> U,
+        U: Response,
+    {
+        let _ = (if_, f);
         async move {}
     }
 
@@ -346,26 +361,14 @@ where
                     .await
             }
 
-            async fn any_leaf<F, U>(&mut self, f: F)
+            async fn leaf_if<I, F, U>(&mut self, if_: I, f: F)
             where
+                I: FnOnce(&Method) -> bool,
                 F: AsyncFnOnce(T, Request) -> U,
                 U: Response,
             {
                 self.0
-                    .any_leaf(async |self_, req| match self_ {
-                        Some(self_) => Some(f(self_, req).await),
-                        None => None,
-                    })
-                    .await;
-            }
-
-            async fn leaf<F, U>(&mut self, method: Method, f: F)
-            where
-                F: AsyncFnOnce(T, Request) -> U,
-                U: Response,
-            {
-                self.0
-                    .leaf(method, async |self_, req| match self_ {
+                    .leaf_if(if_, async |self_, req| match self_ {
                         Some(self_) => Some(f(self_, req).await),
                         None => None,
                     })
@@ -377,47 +380,167 @@ where
         }
     }
 }
+impl<T, E> MakeRoute for Result<T, E>
+where
+    T: MakeRoute,
+    E: Response,
+{
+    fn register<R: Router<Self>>(router: &mut R) -> impl Future<Output = ()> {
+        struct ResultRouter<'a, R, E>(&'a mut R, std::marker::PhantomData<E>);
+        impl<T, E, R> Router<T> for ResultRouter<'_, R, E>
+        where
+            T: MakeRoute,
+            E: Response,
+            R: Router<Result<T, E>>,
+        {
+            async fn middleware<F, U>(&mut self, f: F)
+            where
+                F: AsyncFnOnce(T, &mut Request) -> U,
+                U: MakeRoute,
+            {
+                self.0
+                    .middleware(async |self_, req| match self_ {
+                        Ok(self_) => Ok(f(self_, req).await),
+                        Err(e) => Err(e),
+                    })
+                    .await;
+            }
+
+            async fn route_if<I, F, U>(&mut self, if_: I, f: F)
+            where
+                I: FnOnce(&StringId) -> bool,
+                F: AsyncFnOnce(T, &mut Request, StringId) -> U,
+                U: MakeRoute,
+            {
+                self.0
+                    .route_if(if_, async |self_, req, path| match self_ {
+                        Ok(self_) => Ok(f(self_, req, path).await),
+                        Err(e) => Err(e),
+                    })
+                    .await
+            }
+
+            async fn route_if_recursive<I, F, U>(&mut self, if_: I, f: F)
+            where
+                I: FnOnce(&StringId) -> bool,
+                F: AsyncFnOnce(T, &mut Request, StringId) -> U,
+                U: MakeRoute,
+            {
+                self.0
+                    .route_if_recursive(if_, async |self_, req, path| match self_ {
+                        Ok(self_) => Ok(f(self_, req, path).await),
+                        Err(e) => Err(e),
+                    })
+                    .await
+            }
+
+            async fn leaf_if<I, F, U>(&mut self, if_: I, f: F)
+            where
+                I: FnOnce(&Method) -> bool,
+                F: AsyncFnOnce(T, Request) -> U,
+                U: Response,
+            {
+                self.0
+                    .leaf_if(if_, async |self_, req| match self_ {
+                        Ok(self_) => Ok(f(self_, req).await),
+                        Err(e) => Err(e),
+                    })
+                    .await
+            }
+        }
+
+        async move {
+            T::register(&mut ResultRouter(router, Default::default())).await;
+        }
+    }
+}
 impl MakeRoute for () {
     async fn register<R: Router<Self>>(_router: &mut R) {}
 }
 
 pub struct RouterResponse {
-    status: StatusCode,
-    body: Option<serde_json::Value>,
+    boxed: Box<dyn BoxedResponse>,
 }
 impl RouterResponse {
-    pub fn new<R: Response>(response: R) -> Self {
+    pub fn new<R: Response + 'static>(response: R) -> Self {
         Self {
-            status: response.status_code(),
-            body: response
-                .into_body()
-                .map(|body| serde_json::to_value(body).unwrap()),
+            boxed: Box::new(response),
         }
     }
 
     pub fn e404() -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            body: None,
-        }
+        Self::new(EmptyResponse(StatusCode::NOT_FOUND))
     }
 
     pub fn e405() -> Self {
-        Self {
-            status: StatusCode::METHOD_NOT_ALLOWED,
-            body: None,
-        }
+        Self::new(EmptyResponse(StatusCode::METHOD_NOT_ALLOWED))
+    }
+
+    pub fn downcast<T>(&self) -> &T
+    where
+        T: 'static,
+    {
+        assert_eq!(
+            self.boxed.type_id(),
+            TypeId::of::<T>(),
+            "Expected {:?} got {:?}",
+            std::any::type_name::<T>(),
+            self.boxed.type_name(),
+        );
+
+        unsafe { &*(self.boxed.as_ref() as *const dyn BoxedResponse as *const T) }
     }
 }
 impl Response for RouterResponse {
     type Body = serde_json::Value;
 
     fn into_body(self) -> Option<Self::Body> {
-        self.body
+        self.boxed.into_json()
     }
 
     fn status_code(&self) -> StatusCode {
-        self.status
+        self.boxed.status_code()
+    }
+}
+
+struct EmptyResponse(StatusCode);
+impl Response for EmptyResponse {
+    type Body = serde_json::Value;
+
+    fn into_body(self) -> Option<Self::Body> {
+        None
+    }
+
+    fn status_code(&self) -> StatusCode {
+        self.0
+    }
+}
+
+trait BoxedResponse: 'static {
+    fn into_json(self: Box<Self>) -> Option<serde_json::Value>;
+    fn status_code(&self) -> StatusCode;
+    fn type_id(&self) -> TypeId;
+    fn type_name(&self) -> &'static str;
+}
+impl<R> BoxedResponse for R
+where
+    R: Response,
+{
+    fn into_json(self: Box<Self>) -> Option<serde_json::Value> {
+        self.into_body()
+            .map(|body| serde_json::to_value(body).unwrap())
+    }
+
+    fn status_code(&self) -> StatusCode {
+        Response::status_code(self)
+    }
+
+    fn type_id(&self) -> TypeId {
+        TypeId::of::<Self>()
+    }
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
     }
 }
 
@@ -465,5 +588,120 @@ impl<T, U> RouterState<T, U> {
             RouterState::Response(response) => Either::Right(response),
             RouterState::Empty => unreachable!("Empty never is not accessible from outside"),
         }
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use crate::{handler::Json200, uri_subject::path_str_to_path};
+
+    type Str200 = Json200<&'static str>;
+
+    struct Given;
+    impl Given {
+        fn start<F>(test: F)
+        where
+            F: AsyncFnOnce(Given),
+        {
+            tracing_subscriber::fmt::init();
+
+            let rt = tokio::runtime::LocalRuntime::new().unwrap();
+            rt.block_on(test(Given))
+        }
+
+        async fn get<T, R>(&self, root: R, path: &str) -> T
+        where
+            R: MakeRoute,
+            T: Response + Clone,
+        {
+            let req = Request {
+                method: Method::GET,
+                path: path_str_to_path(path),
+                headers: Default::default(),
+                query: Default::default(),
+                body: Default::default(),
+            };
+            RouterHandler::do_handle(root, req)
+                .await
+                .downcast::<T>()
+                .clone()
+        }
+    }
+
+    #[test]
+    fn downcast_response() {
+        let response = RouterResponse::new(Json200("Ola"));
+        assert_eq!(response.downcast::<Json200<&'static str>>().0, "Ola");
+    }
+
+    #[test]
+    fn error_response() {
+        Given::start(async |given| {
+            struct Root;
+            impl MakeRoute for Root {
+                async fn register<R: Router<Self>>(router: &mut R) {
+                    router
+                        .route(async |_, _, path| {
+                            if path == "inexistent" {
+                                Err(Json200("circuit breaker"))
+                            } else {
+                                Ok(Middleware)
+                            }
+                        })
+                        .await;
+                }
+            }
+            struct Middleware;
+            impl MakeRoute for Middleware {
+                async fn register<R: Router<Self>>(router: &mut R) {
+                    router.middleware(async |_, _| JustRoute).await
+                }
+            }
+            struct JustRoute;
+            impl MakeRoute for JustRoute {
+                async fn register<R: Router<Self>>(router: &mut R) {
+                    router.route(async |_, _, _| Root2).await
+                }
+            }
+            struct Root2;
+            impl MakeRoute for Root2 {
+                async fn register<R: Router<Self>>(router: &mut R) {
+                    router.route_recursive(async |self_, _, _| self_).await;
+
+                    router.any_leaf(async |_, _| Json200("done")).await;
+                }
+            }
+
+            assert_eq!(
+                given
+                    .get::<Result<Str200, Str200>, _>(Root, "hello/thing/more")
+                    .await
+                    .ok()
+                    .unwrap()
+                    .0,
+                "done"
+            );
+
+            assert_eq!(
+                given
+                    .get::<Result<Str200, Str200>, _>(Root, "hello/thing")
+                    .await
+                    .ok()
+                    .unwrap()
+                    .0,
+                "done"
+            );
+
+            assert_eq!(
+                given
+                    .get::<Result<Str200, Str200>, _>(Root, "inexistent/more/more")
+                    .await
+                    .err()
+                    .unwrap()
+                    .0,
+                "circuit breaker"
+            );
+        });
     }
 }

@@ -8,6 +8,7 @@ use std::{
 use either::Either;
 use hyper::{Method, StatusCode};
 
+#[derive(Debug)]
 pub struct Request {
     pub method: Method,
     pub path: VecDeque<StringId>,
@@ -42,7 +43,7 @@ pub trait Handler {
     fn handle(&self, req: Request) -> impl Future<Output = Self::Response>;
 }
 
-pub trait Response {
+pub trait Response: 'static {
     type Body: serde::Serialize;
 
     fn into_body(self) -> Option<Self::Body>;
@@ -148,13 +149,14 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Json200<T>(pub T);
 impl<T: serde::Serialize> From<T> for Json200<T> {
     fn from(value: T) -> Self {
         Self(value)
     }
 }
-impl<T: serde::Serialize> Response for Json200<T> {
+impl<T: serde::Serialize + 'static> Response for Json200<T> {
     type Body = T;
 
     fn into_body(self) -> Option<Self::Body> {
@@ -235,6 +237,18 @@ impl Deref for StringId {
 impl PartialEq for StringId {
     fn eq(&self, other: &Self) -> bool {
         PartialEq::eq(self.id(), other.id())
+    }
+}
+impl PartialEq<&str> for StringId {
+    fn eq(&self, other: &&str) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+
+        self.id()
+            .chars()
+            .zip(other.chars().flat_map(char::to_lowercase))
+            .all(|(lhs, rhs)| lhs == rhs)
     }
 }
 impl Eq for StringId {}
