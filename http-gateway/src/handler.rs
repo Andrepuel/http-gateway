@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     hash::Hash,
     io,
-    ops::Deref,
+    ops::Deref, rc::Rc,
 };
 
 use either::Either;
@@ -41,6 +41,13 @@ pub trait Handler {
     type Response: Response;
 
     fn handle(&self, req: Request) -> impl Future<Output = Self::Response>;
+}
+impl<H: Handler> Handler for Rc<H> {
+    type Response = H::Response;
+
+    fn handle(&self, req: Request) -> impl Future<Output = Self::Response> {
+        H::handle(self, req)
+    }
 }
 
 pub trait Response: 'static {

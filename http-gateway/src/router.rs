@@ -417,7 +417,7 @@ where
         async move {
             router
                 .middleware_if(
-                    |self_, _| self_.is_some(),
+                    |self_, _| self_.is_none(),
                     async |self_, _| match self_ {
                         Some(_) => unreachable!(),
                         None => ShortCircuit(Empty404),
