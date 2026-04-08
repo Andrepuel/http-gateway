@@ -2,7 +2,8 @@ use std::{
     collections::{HashMap, VecDeque},
     hash::Hash,
     io,
-    ops::Deref, rc::Rc,
+    ops::Deref,
+    rc::Rc,
 };
 
 use either::Either;

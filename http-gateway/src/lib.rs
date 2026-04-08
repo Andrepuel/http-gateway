@@ -25,6 +25,45 @@ use tracing::Instrument;
 use url::Url;
 use uuid::Uuid;
 
+pub use hyper;
+pub use serde_json;
+
+pub fn http_server_main<F, H>(handler: F)
+where
+    F: FnOnce() -> H,
+    H: Handler + 'static,
+{
+    let r = dotenvy::dotenv();
+    tracing_subscriber::fmt::init();
+    if let Err(e) = r {
+        tracing::warn!(%e, "Bad dotenv file");
+        tracing::debug!(?e);
+    }
+
+    let r = tokio::runtime::LocalRuntime::new()
+        .unwrap()
+        .block_on(async move {
+            let listen = std::env::var("LISTEN")
+                .map_err(|e| io::Error::other(format!("Missing var LISTEN: {e}")))?;
+
+            let listen = listen
+                .parse()
+                .map_err(|e| io::Error::other(format!("Bad LISTEN url ({listen:?}): {e}")))?;
+
+            http_server(listen, handler())
+                .instrument(tracing::info_span!("server"))
+                .await
+        });
+
+    match r {
+        Ok(_) => unreachable!(),
+        Err(e) => {
+            tracing::error!(%e, "Fatal error");
+            tracing::debug!(?e);
+        }
+    }
+}
+
 pub async fn http_server<H>(listen: Url, handler: H) -> io::Result<Never>
 where
     H: Handler + 'static,

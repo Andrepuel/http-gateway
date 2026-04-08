@@ -1,45 +1,11 @@
-use std::{collections::HashMap, io};
-
 use http_gateway::{
-    Never,
     handler::{Authorization, Json200, StringId},
-    http_server,
     router::{self, MakeRoute, RouterHandler},
 };
-use tracing::Instrument;
+use std::collections::HashMap;
 
 fn main() {
-    let r = dotenvy::dotenv();
-    tracing_subscriber::fmt::init();
-    if let Err(e) = r {
-        tracing::warn!(%e, "Bad dotenv file");
-        tracing::debug!(?e);
-    }
-
-    let r = tokio::runtime::LocalRuntime::new()
-        .unwrap()
-        .block_on(async_main());
-
-    match r {
-        Ok(_) => unreachable!(),
-        Err(e) => {
-            tracing::error!(%e, "Fatal error");
-            tracing::debug!(?e);
-        }
-    }
-}
-
-async fn async_main() -> io::Result<Never> {
-    let listen = std::env::var("LISTEN")
-        .map_err(|e| io::Error::other(format!("Missing var LISTEN: {e}")))?;
-
-    let listen = listen
-        .parse()
-        .map_err(|e| io::Error::other(format!("Bad LISTEN url ({listen:?}): {e}")))?;
-
-    http_server(listen, RouterHandler::new(AuthRouter))
-        .instrument(tracing::info_span!("server"))
-        .await
+    http_gateway::http_server_main(|| RouterHandler::new(AuthRouter));
 }
 
 #[derive(Clone, Copy)]

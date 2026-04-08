@@ -1,0 +1,12 @@
+[package]
+name = "http-todos"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dotenvy = "0.15.7"
+http-gateway = { path = "../http-gateway" }
+serde = { version = "1.0.228", features = ["derive"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
+uuid = { version = "1.23.0", features = ["serde", "v7"] }

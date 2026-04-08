@@ -264,6 +264,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-todos"
+version = "0.1.0"
+dependencies = [
+ "dotenvy",
+ "http-gateway",
+ "serde",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -802,6 +814,7 @@ checksum = "5ac8b6f42ead25368cf5b098aeb3dc8a1a2c05a3eee8a9a1a68c640edbfc79d9"
 dependencies = [
  "getrandom",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

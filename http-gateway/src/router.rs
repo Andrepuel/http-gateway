@@ -55,13 +55,13 @@ where
                 impl<R> Router<R> for FindRoute<R> {
                     async fn route_if<I, F, U>(&mut self, if_: I, f: F)
                     where
-                        I: FnOnce(&R, &StringId) -> bool,
+                        I: FnOnce(&R, &Request, &StringId) -> bool,
                         F: AsyncFnOnce(R, &mut Request, StringId) -> U,
                         U: MakeRoute,
                     {
                         self.0
                             .execute_if(
-                                |(req_path, root, _)| if_(root, req_path),
+                                |(req_path, root, req)| if_(root, req, req_path),
                                 async |(path, root, mut req)| {
                                     let route = f(root, &mut req, path).await;
 
@@ -209,7 +209,7 @@ pub trait Router<T> {
         P: Into<StringId>,
     {
         self.route_if(
-            |_, req_path| req_path == &path.into(),
+            |_, _, req_path| req_path == &path.into(),
             async |a1, a2, _a3| f(a1, a2).await,
         )
     }
@@ -231,7 +231,7 @@ pub trait Router<T> {
         F: AsyncFnOnce(T, &mut Request, StringId) -> U,
         U: MakeRoute,
     {
-        self.route_if(|_, _| true, f)
+        self.route_if(|_, _, _| true, f)
     }
 
     fn route_recursive<F, U>(&mut self, f: F) -> impl Future<Output = ()>
@@ -244,7 +244,7 @@ pub trait Router<T> {
 
     fn route_if<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
     where
-        I: FnOnce(&T, &StringId) -> bool,
+        I: FnOnce(&T, &Request, &StringId) -> bool,
         F: AsyncFnOnce(T, &mut Request, StringId) -> U,
         U: MakeRoute,
     {
@@ -319,9 +319,100 @@ pub trait Router<T> {
     {
         self.leaf(Method::DELETE, f)
     }
+
+    fn leaf_route<F, U>(&mut self, method: Method, f: F) -> impl Future<Output = ()>
+    where
+        F: AsyncFnOnce(T, &mut Request, StringId) -> U,
+        U: Response,
+    {
+        self.route_if(
+            move |_, req, _| req.method == method,
+            async |self_, req, path| LeafRoute(f(self_, req, path).await),
+        )
+    }
+
+    fn get_route<F, U>(&mut self, f: F) -> impl Future<Output = ()>
+    where
+        F: AsyncFnOnce(T, &mut Request, StringId) -> U,
+        U: Response,
+    {
+        self.leaf_route(Method::GET, f)
+    }
+
+    fn put_route<F, U>(&mut self, f: F) -> impl Future<Output = ()>
+    where
+        F: AsyncFnOnce(T, &mut Request, StringId) -> U,
+        U: Response,
+    {
+        self.leaf_route(Method::PUT, f)
+    }
+
+    fn post_route<F, U>(&mut self, f: F) -> impl Future<Output = ()>
+    where
+        F: AsyncFnOnce(T, &mut Request, StringId) -> U,
+        U: Response,
+    {
+        self.leaf_route(Method::POST, f)
+    }
+
+    fn delete_route<F, U>(&mut self, f: F) -> impl Future<Output = ()>
+    where
+        F: AsyncFnOnce(T, &mut Request, StringId) -> U,
+        U: Response,
+    {
+        self.leaf_route(Method::DELETE, f)
+    }
+
+    fn leaf_path<P, F, U>(&mut self, path: P, method: Method, f: F) -> impl Future<Output = ()>
+    where
+        P: Into<StringId>,
+        F: AsyncFnOnce(T, &mut Request) -> U,
+        U: Response,
+    {
+        self.route_if(
+            move |_, req, req_path| req.method == method && req_path == &path.into(),
+            async |self_, req, _| LeafRoute(f(self_, req).await),
+        )
+    }
+
+    fn get_path<P, F, U>(&mut self, path: P, f: F) -> impl Future<Output = ()>
+    where
+        P: Into<StringId>,
+        F: AsyncFnOnce(T, &mut Request) -> U,
+        U: Response,
+    {
+        self.leaf_path(path, Method::GET, f)
+    }
+
+    fn put_path<P, F, U>(&mut self, path: P, f: F) -> impl Future<Output = ()>
+    where
+        P: Into<StringId>,
+        F: AsyncFnOnce(T, &mut Request) -> U,
+        U: Response,
+    {
+        self.leaf_path(path, Method::PUT, f)
+    }
+
+    fn post_path<P, F, U>(&mut self, path: P, f: F) -> impl Future<Output = ()>
+    where
+        P: Into<StringId>,
+        F: AsyncFnOnce(T, &mut Request) -> U,
+        U: Response,
+    {
+        self.leaf_path(path, Method::POST, f)
+    }
+
+    fn delete_path<P, F, U>(&mut self, path: P, f: F) -> impl Future<Output = ()>
+    where
+        P: Into<StringId>,
+        F: AsyncFnOnce(T, &mut Request) -> U,
+        U: Response,
+    {
+        self.leaf_path(path, Method::DELETE, f)
+    }
 }
 
-pub trait MakeRoute: Sized + 'static {
+pub trait MakeRoute: Sized {
     fn register<R: Router<Self>>(router: &mut R) -> impl Future<Output = ()>;
 }
 impl<T> MakeRoute for Option<T>
@@ -356,14 +447,14 @@ where
 
             async fn route_if<I, F, U>(&mut self, if_: I, f: F)
             where
-                I: FnOnce(&T, &StringId) -> bool,
+                I: FnOnce(&T, &Request, &StringId) -> bool,
                 F: AsyncFnOnce(T, &mut Request, StringId) -> U,
                 U: MakeRoute,
             {
                 self.0
                     .route_if(
-                        |self_, path| match self_ {
-                            Some(self_) => if_(self_, path),
+                        |self_, req, path| match self_ {
+                            Some(self_) => if_(self_, req, path),
                             None => false,
                         },
                         async |self_, req, path| match self_ {
@@ -463,14 +554,14 @@ where
 
             async fn route_if<I, F, U>(&mut self, if_: I, f: F)
             where
-                I: FnOnce(&T, &StringId) -> bool,
+                I: FnOnce(&T, &Request, &StringId) -> bool,
                 F: AsyncFnOnce(T, &mut Request, StringId) -> U,
                 U: MakeRoute,
             {
                 self.0
                     .route_if(
-                        |self_, path| match self_ {
-                            Ok(self_) => if_(self_, path),
+                        |self_, req, path| match self_ {
+                            Ok(self_) => if_(self_, req, path),
                             Err(_) => false,
                         },
                         async |self_, req, path| match self_ {
@@ -596,14 +687,14 @@ where
 
             async fn route_if<I, F, U>(&mut self, if_: I, f: F)
             where
-                I: FnOnce(&T, &StringId) -> bool,
+                I: FnOnce(&T, &Request, &StringId) -> bool,
                 F: AsyncFnOnce(T, &mut Request, StringId) -> U,
                 U: MakeRoute,
             {
                 self.0
                     .route_if(
-                        |self_, path| match O::open_ref(self_) {
-                            Some(self_) => if_(self_, path),
+                        |self_, req, path| match O::open_ref(self_) {
+                            Some(self_) => if_(self_, req, path),
                             None => false,
                         },
                         async |self_, req, path| match O::open(self_) {
@@ -681,6 +772,16 @@ where
     async fn register<R: Router<Self>>(router: &mut R) {
         router.route_recursive(async |self_, _, _| self_).await;
         router.any_leaf(async |self_, _| self_.0).await;
+    }
+}
+
+struct LeafRoute<T>(T);
+impl<T> MakeRoute for LeafRoute<T>
+where
+    T: Response,
+{
+    async fn register<R: Router<Self>>(router: &mut R) {
+        router.any_leaf(async |self_, _| self_.0).await
     }
 }
 
@@ -919,7 +1020,7 @@ pub mod tests {
                 async fn register<R: Router<Self>>(router: &mut R) {
                     router
                         .route_if(
-                            |_, path| path == "left" || path == "right",
+                            |_, _, path| path == "left" || path == "right",
                             async |_, _, path| {
                                 if path == "left" {
                                     Either::Left(Mid(LeftRoute))
