@@ -251,6 +251,11 @@ impl PartialEq<&str> for StringId {
             .all(|(lhs, rhs)| lhs == rhs)
     }
 }
+impl PartialEq<&str> for &StringId {
+    fn eq(&self, other: &&str) -> bool {
+        StringId::eq(self, other)
+    }
+}
 impl Eq for StringId {}
 impl PartialOrd for StringId {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
