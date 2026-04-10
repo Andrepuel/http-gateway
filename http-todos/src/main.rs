@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 use http_gateway::{
-    handler::{Json200, Response, StringId},
+    handler::{Json, Response, StringId},
     http_server_main,
     hyper::StatusCode,
     router::{MakeRoute, Router, RouterHandler},
@@ -60,7 +60,7 @@ impl MakeRoute for TasksDbRoute {
                     .iter()
                     .map(|(id, task)| TodoTaskOut::from((*id, task.borrow().clone().clone())))
                     .collect::<Vec<_>>();
-                Json200(tasks)
+                Json::j200(tasks)
             })
             .await;
 
@@ -69,7 +69,7 @@ impl MakeRoute for TasksDbRoute {
                 let id = Self::id(&path);
                 let task = self_.db.borrow_mut().remove(&id)?.clone();
 
-                Some(Json200(TodoTaskOut::from((id, task.borrow().clone()))))
+                Some(Json::j200(TodoTaskOut::from((id, task.borrow().clone()))))
             })
             .await;
 
@@ -85,7 +85,7 @@ impl MakeRoute for TasksDbRoute {
                     .insert(id, Rc::new(RefCell::new(new_task.clone())));
 
                 // TODO 201 with location
-                Result::<_, Error422>::Ok(Json200(TodoTaskOut::from((id, new_task))))
+                Result::<_, Error422>::Ok(Json::j200(TodoTaskOut::from((id, new_task))))
             })
             .await;
 
@@ -122,13 +122,13 @@ impl MakeRoute for ExistentTask {
     async fn register<R: Router<Self>>(router: &mut R) {
         router
             .get(async |self_, _| {
-                Json200(TodoTaskOut::from((self_.id, self_.task.borrow().clone())))
+                Json::j200(TodoTaskOut::from((self_.id, self_.task.borrow().clone())))
             })
             .await;
 
         router
             .get_path("title", async |self_, _| {
-                Json200(self_.task.borrow().title.clone())
+                Json::j200(self_.task.borrow().title.clone())
             })
             .await;
 
@@ -138,12 +138,14 @@ impl MakeRoute for ExistentTask {
                     .map_err(Error422::from)?;
                 self_.task.borrow_mut().title = title.clone();
 
-                Result::<_, Error422>::Ok(Json200(title))
+                Result::<_, Error422>::Ok(Json::j200(title))
             })
             .await;
 
         router
-            .get_path("done", async |self_, _| Json200(self_.task.borrow().done))
+            .get_path("done", async |self_, _| {
+                Json::j200(self_.task.borrow().done)
+            })
             .await;
 
         router
@@ -152,7 +154,7 @@ impl MakeRoute for ExistentTask {
                     .map_err(Error422::from)?;
                 self_.task.borrow_mut().done = done;
 
-                Result::<_, Error422>::Ok(Json200(done))
+                Result::<_, Error422>::Ok(Json::j200(done))
             })
             .await;
     }
@@ -187,10 +189,11 @@ impl From<serde_json::Error> for Error422 {
     }
 }
 impl Response for Error422 {
-    type Body = Self;
+    type Body = <Json<Self> as Response>::Body;
 
-    fn into_body(self) -> Option<Self::Body> {
-        Some(self)
+    fn into_body(self) -> Self::Body {
+        let code = self.status_code();
+        Json(self, code).into_body()
     }
 
     fn status_code(&self) -> StatusCode {
