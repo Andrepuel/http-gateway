@@ -1,8 +1,8 @@
-use crate::handler::{Empty404, Handler, Request, Response, StringId};
+use crate::handler::{Empty404, Handler, NoBody, Request, Response, ResponseBody, StringId};
 use either::Either;
 use futures::FutureExt;
 use hyper::{Method, StatusCode};
-use std::any::TypeId;
+use std::{any::TypeId, collections::HashMap, pin::Pin};
 
 pub struct RouterHandler<R> {
     root: R,
@@ -820,33 +820,40 @@ impl RouterResponse {
     }
 }
 impl Response for RouterResponse {
-    type Body = serde_json::Value;
-
-    fn into_body(self) -> Option<Self::Body> {
-        self.boxed.into_json()
-    }
-
+    type Body = Pin<Box<dyn ResponseBody>>;
+    
     fn status_code(&self) -> StatusCode {
         self.boxed.status_code()
     }
+    
+    fn into_body(self) -> Self::Body {
+        self.boxed.into_body()
+    }
+    
+    fn extra_headers(&self) -> HashMap<StringId, String> {
+        self.boxed.extra_headers()
+    }
+
+    
 }
 
 struct EmptyResponse(StatusCode);
 impl Response for EmptyResponse {
-    type Body = serde_json::Value;
-
-    fn into_body(self) -> Option<Self::Body> {
-        None
-    }
+    type Body = NoBody;
 
     fn status_code(&self) -> StatusCode {
         self.0
     }
+    
+    fn into_body(self) -> Self::Body {
+        NoBody
+    }
 }
 
 trait BoxedResponse: 'static {
-    fn into_json(self: Box<Self>) -> Option<serde_json::Value>;
+    fn into_body(self: Box<Self>) -> Pin<Box<dyn ResponseBody>>;
     fn status_code(&self) -> StatusCode;
+    fn extra_headers(&self) -> HashMap<StringId, String>;
     fn type_id(&self) -> TypeId;
     fn type_name(&self) -> &'static str;
 }
@@ -854,13 +861,16 @@ impl<R> BoxedResponse for R
 where
     R: Response,
 {
-    fn into_json(self: Box<Self>) -> Option<serde_json::Value> {
-        self.into_body()
-            .map(|body| serde_json::to_value(body).unwrap())
+    fn into_body(self: Box<Self>) -> Pin<Box<dyn ResponseBody>> {
+        Box::pin(Response::into_body(*self))
     }
 
     fn status_code(&self) -> StatusCode {
         Response::status_code(self)
+    }
+
+    fn extra_headers(&self) -> HashMap<StringId, String> {
+        Response::extra_headers(self)
     }
 
     fn type_id(&self) -> TypeId {

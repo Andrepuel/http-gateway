@@ -6,25 +6,31 @@ pub mod tokio_hyper;
 pub mod uri_subject;
 
 use crate::{
-    handler::{Handler, Request, Response, StringId},
+    handler::{Handler, NoBody, Request, Response, ResponseBody, StringId},
     tokio_hyper::TokioHyper,
 };
+use bytes::BytesMut;
 use futures::pin_mut;
-use http_body_util::{BodyExt, Full};
-use hyper::{StatusCode, body::Incoming, header::HeaderValue, service::service_fn};
+use http_body_util::BodyExt;
+use hyper::{
+    StatusCode,
+    body::Incoming,
+    header::{HeaderName, HeaderValue},
+    service::service_fn,
+};
 use std::{
-    collections::{HashMap, VecDeque},
-    future::poll_fn,
-    io,
-    rc::Rc,
-    sync::Arc,
+    collections::HashMap, future::poll_fn, io, pin::Pin, rc::Rc, str::FromStr, sync::Arc,
     task::Poll,
 };
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncRead, ReadBuf},
+    net::TcpListener,
+};
 use tracing::Instrument;
 use url::Url;
 use uuid::Uuid;
 
+pub use bytes;
 pub use hyper;
 pub use serde_json;
 
@@ -131,7 +137,7 @@ async fn service_http<H>(
     reqid: Arc<str>,
     handler: H,
     req: hyper::Request<Incoming>,
-) -> io::Result<hyper::Response<FullBody>>
+) -> io::Result<hyper::Response<WriteBody>>
 where
     H: Handler,
 {
@@ -209,40 +215,81 @@ where
 
     let response = response.map_err(|_| PanicResponse);
     let status = response.status_code();
-    let (content_type, body) = match response.into_body() {
-        Some(body) => {
-            let body = serde_json::to_string_pretty(&body).unwrap().into_bytes();
-            (Some("application/json"), body)
-        }
-        None => Default::default(),
-    };
+    let headers = response.extra_headers();
+    let response = response.into_body();
+    let content_type = response.content_type();
 
-    let mut response = hyper::Response::new(Full::new(body.into()));
+    let mut response = hyper::Response::new(WriteBody {
+        write: Box::pin(response),
+        buf: Default::default(),
+    });
     *response.status_mut() = status;
 
-    if let Some(content_type) = content_type {
+    if !content_type.is_empty() {
         response.headers_mut().append(
             "content-type",
-            HeaderValue::from_str(content_type).map_err(io::Error::other)?,
+            HeaderValue::from_str(&content_type).map_err(io::Error::other)?,
+        );
+    }
+
+    for (header, value) in headers {
+        response.headers_mut().append(
+            HeaderName::from_str(&header).map_err(io::Error::other)?,
+            HeaderValue::from_str(&value).map_err(io::Error::other)?,
         );
     }
 
     Ok(response)
 }
 
-type FullBody = Full<VecDeque<u8>>;
+struct WriteBody {
+    write: Pin<Box<dyn ResponseBody>>,
+    buf: BytesMut,
+}
+impl hyper::body::Body for WriteBody {
+    type Data = BytesMut;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if self.buf.len() < 4096 {
+            self.buf.resize(8192, 0);
+        }
+
+        let self_ = self.get_mut();
+        let write = self_.write.as_mut();
+        let mut buf = ReadBuf::new(&mut self_.buf);
+        match AsyncRead::poll_read(write, cx, &mut buf) {
+            Poll::Ready(Ok(())) => match buf.filled().len() {
+                0 => Poll::Ready(None),
+                n => Poll::Ready(Some(Ok(hyper::body::Frame::data(self_.buf.split_to(n))))),
+            },
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        match self.write.length() {
+            Some(len) => hyper::body::SizeHint::with_exact(len),
+            None => Default::default(),
+        }
+    }
+}
 
 pub enum Never {}
 
 struct PanicResponse;
 impl Response for PanicResponse {
-    type Body = ();
-
-    fn into_body(self) -> Option<Self::Body> {
-        None
-    }
+    type Body = NoBody;
 
     fn status_code(&self) -> StatusCode {
         StatusCode::INTERNAL_SERVER_ERROR
+    }
+
+    fn into_body(self) -> Self::Body {
+        NoBody
     }
 }

@@ -1,10 +1,9 @@
+use crate::handler::StringId;
 use hyper::Uri;
 use std::{
     collections::{HashMap, VecDeque},
     ops::Deref,
 };
-
-use crate::handler::StringId;
 
 pub fn uri_to_path(uri: Uri) -> VecDeque<StringId> {
     let Some(path_and_query) = uri.path_and_query() else {
@@ -18,7 +17,7 @@ pub fn path_str_to_path(path: &str) -> VecDeque<StringId> {
     path.split('/')
         .filter_map(|path| urlencoding::decode(path).ok())
         .filter(|path| !str::is_empty(path.deref()))
-        .map(|path| replace_special_chars(path.into_owned()))
+        .map(|path| path.into_owned())
         .map(StringId::from)
         .collect()
 }
@@ -37,16 +36,6 @@ pub fn uri_to_query(uri: &Uri) -> HashMap<StringId, String> {
         .filter_map(|(k, v)| Some((urlencoding::decode(k).ok()?, urlencoding::decode(v).ok()?)))
         .map(|(k, v)| (StringId::from(k.into_owned()), v.to_string()))
         .collect()
-}
-
-fn replace_special_chars(mut path: String) -> String {
-    for char in ['.', ' ', '*', '>'] {
-        if path.contains(char) {
-            path = path.replace(char, "_");
-        }
-    }
-
-    path
 }
 
 #[cfg(test)]

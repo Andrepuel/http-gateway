@@ -1,13 +1,17 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     hash::Hash,
     io,
     ops::Deref,
+    pin::Pin,
     rc::Rc,
+    task::{Context, Poll},
 };
 
 use either::Either;
 use hyper::{Method, StatusCode};
+use tokio::io::AsyncRead;
 
 #[derive(Debug)]
 pub struct Request {
@@ -52,18 +56,19 @@ impl<H: Handler> Handler for Rc<H> {
 }
 
 pub trait Response: 'static {
-    type Body: serde::Serialize;
+    type Body: ResponseBody;
 
-    fn into_body(self) -> Option<Self::Body>;
     fn status_code(&self) -> StatusCode;
+    fn into_body(self) -> Self::Body;
+    fn extra_headers(&self) -> HashMap<StringId, String> {
+        Default::default()
+    }
 }
 impl Response for io::Error {
-    type Body = serde_json::Value;
+    type Body = NoBody;
 
-    fn into_body(self) -> Option<Self::Body> {
-        tracing::error!(e=%self, "Server internal error");
-        tracing::debug!(e=?self);
-        None
+    fn into_body(self) -> Self::Body {
+        NoBody
     }
 
     fn status_code(&self) -> StatusCode {
@@ -75,20 +80,27 @@ where
     T: Response,
     E: Response,
 {
-    type Body = EitherSer<T::Body, E::Body>;
-
-    fn into_body(self) -> Option<Self::Body> {
-        match self {
-            Ok(ok) => ok.into_body().map(Either::Left),
-            Err(err) => err.into_body().map(Either::Right),
-        }
-        .map(Into::into)
-    }
+    type Body = EitherBody<T::Body, E::Body>;
 
     fn status_code(&self) -> StatusCode {
         match self {
             Ok(self_) => self_.status_code(),
             Err(self_) => self_.status_code(),
+        }
+    }
+
+    fn into_body(self) -> Self::Body {
+        match self {
+            Ok(self_) => Either::Left(self_.into_body()),
+            Err(self_) => Either::Right(self_.into_body()),
+        }
+        .into()
+    }
+
+    fn extra_headers(&self) -> HashMap<StringId, String> {
+        match self {
+            Ok(self_) => self_.extra_headers(),
+            Err(self_) => self_.extra_headers(),
         }
     }
 }
@@ -97,15 +109,7 @@ where
     T1: Response,
     T2: Response,
 {
-    type Body = EitherSer<T1::Body, T2::Body>;
-
-    fn into_body(self) -> Option<Self::Body> {
-        match self {
-            Either::Left(self_) => self_.into_body().map(Either::Left),
-            Either::Right(self_) => self_.into_body().map(Either::Right),
-        }
-        .map(Into::into)
-    }
+    type Body = EitherBody<T1::Body, T2::Body>;
 
     fn status_code(&self) -> StatusCode {
         match self {
@@ -113,19 +117,27 @@ where
             Either::Right(self_) => self_.status_code(),
         }
     }
+
+    fn into_body(self) -> Self::Body {
+        match self {
+            Either::Left(self_) => Either::Left(self_.into_body()),
+            Either::Right(self_) => Either::Right(self_.into_body()),
+        }
+        .into()
+    }
+
+    fn extra_headers(&self) -> HashMap<StringId, String> {
+        match self {
+            Either::Left(self_) => self_.extra_headers(),
+            Either::Right(self_) => self_.extra_headers(),
+        }
+    }
 }
 impl<T> Response for Option<T>
 where
     T: Response,
 {
-    type Body = T::Body;
-
-    fn into_body(self) -> Option<Self::Body> {
-        match self {
-            Some(self_) => self_.into_body(),
-            None => None,
-        }
-    }
+    type Body = EitherBody<T::Body, NoBody>;
 
     fn status_code(&self) -> StatusCode {
         match self {
@@ -133,59 +145,205 @@ where
             None => StatusCode::NOT_FOUND,
         }
     }
+
+    fn into_body(self) -> Self::Body {
+        match self {
+            Some(self_) => Either::Left(self_.into_body()),
+            None => Either::Right(NoBody),
+        }
+        .into()
+    }
+
+    fn extra_headers(&self) -> HashMap<StringId, String> {
+        self.as_ref()
+            .map(Response::extra_headers)
+            .unwrap_or_default()
+    }
 }
 
-pub struct EitherSer<T1, T2>(Either<T1, T2>);
-impl<T1, T2> From<Either<T1, T2>> for EitherSer<T1, T2> {
+pub trait ResponseBody: AsyncRead {
+    fn content_type(&self) -> Cow<'static, str>;
+    fn length(&self) -> Option<u64>;
+}
+impl ResponseBody for Pin<Box<dyn ResponseBody>> {
+    fn content_type(&self) -> Cow<'static, str> {
+        ResponseBody::content_type(self.deref())
+    }
+
+    fn length(&self) -> Option<u64> {
+        ResponseBody::length(self.deref())
+    }
+}
+
+pub struct NoBody;
+impl AsyncRead for NoBody {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+impl ResponseBody for NoBody {
+    fn content_type(&self) -> Cow<'static, str> {
+        Cow::Borrowed("")
+    }
+
+    fn length(&self) -> Option<u64> {
+        Some(0)
+    }
+}
+
+pub struct EitherBody<T1, T2>(Either<T1, T2>);
+impl<T1, T2> From<Either<T1, T2>> for EitherBody<T1, T2> {
     fn from(value: Either<T1, T2>) -> Self {
         Self(value)
     }
 }
-impl<T1, T2> serde::Serialize for EitherSer<T1, T2>
+impl<T1, T2> EitherBody<T1, T2> {
+    fn project(self: Pin<&mut Self>) -> Either<Pin<&mut T1>, Pin<&mut T2>> {
+        unsafe {
+            self.get_unchecked_mut()
+                .0
+                .as_mut()
+                .map_left(|p| Pin::new_unchecked(p))
+                .map_right(|p| Pin::new_unchecked(p))
+        }
+    }
+}
+impl<T1, T2> AsyncRead for EitherBody<T1, T2>
 where
-    T1: serde::Serialize,
-    T2: serde::Serialize,
+    T1: AsyncRead,
+    T2: AsyncRead,
 {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.project() {
+            Either::Left(self_) => self_.poll_read(cx, buf),
+            Either::Right(self_) => self_.poll_read(cx, buf),
+        }
+    }
+}
+impl<T1, T2> ResponseBody for EitherBody<T1, T2>
+where
+    T1: ResponseBody,
+    T2: ResponseBody,
+{
+    fn content_type(&self) -> Cow<'static, str> {
         match &self.0 {
-            Either::Left(self_) => serde::Serialize::serialize(self_, serializer),
-            Either::Right(self_) => serde::Serialize::serialize(self_, serializer),
+            Either::Left(self_) => self_.content_type(),
+            Either::Right(self_) => self_.content_type(),
+        }
+    }
+
+    fn length(&self) -> Option<u64> {
+        match &self.0 {
+            Either::Left(self_) => self_.length(),
+            Either::Right(self_) => self_.length(),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Json200<T>(pub T);
-impl<T: serde::Serialize> From<T> for Json200<T> {
-    fn from(value: T) -> Self {
-        Self(value)
+pub struct HttpResponse<B>(pub B, pub StatusCode);
+impl<B: ResponseBody + 'static> HttpResponse<B> {
+    pub fn h200(b: B) -> Self {
+        Self(b, StatusCode::OK)
     }
 }
-impl<T: serde::Serialize + 'static> Response for Json200<T> {
-    type Body = T;
-
-    fn into_body(self) -> Option<Self::Body> {
-        Some(self.0)
-    }
+impl<B: ResponseBody + 'static> Response for HttpResponse<B> {
+    type Body = B;
 
     fn status_code(&self) -> StatusCode {
-        StatusCode::OK
+        self.1
+    }
+
+    fn into_body(self) -> Self::Body {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Json<T>(pub T, pub StatusCode);
+impl<T: serde::Serialize + 'static> Json<T> {
+    pub fn j200(t: T) -> Self {
+        Self(t, StatusCode::OK)
+    }
+}
+impl<T: serde::Serialize + 'static> Response for Json<T> {
+    type Body = FullBody;
+
+    fn status_code(&self) -> StatusCode {
+        self.1
+    }
+
+    fn into_body(self) -> Self::Body {
+        FullBody(
+            serde_json::to_string_pretty(&self.0)
+                .expect("Serialization should never fail")
+                .into_bytes()
+                .into(),
+            Cow::Borrowed("application/json"),
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Json201<T>(pub T, String);
+impl<T: serde::Serialize + 'static> Response for Json201<T> {
+    type Body = FullBody;
+
+    fn status_code(&self) -> StatusCode {
+        StatusCode::CREATED
+    }
+
+    fn into_body(self) -> Self::Body {
+        let code = self.status_code();
+        Json(self.0, code).into_body()
+    }
+
+    fn extra_headers(&self) -> HashMap<StringId, String> {
+        [(StringId::from("Location"), self.1.clone())]
+            .into_iter()
+            .collect()
     }
 }
 
 pub struct Empty404;
 impl Response for Empty404 {
-    type Body = serde_json::Value;
-
-    fn into_body(self) -> Option<Self::Body> {
-        None
-    }
+    type Body = NoBody;
 
     fn status_code(&self) -> StatusCode {
         StatusCode::NOT_FOUND
+    }
+
+    fn into_body(self) -> Self::Body {
+        NoBody
+    }
+}
+
+pub struct FullBody(bytes::Bytes, Cow<'static, str>);
+impl AsyncRead for FullBody {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let n = self.0.len().min(buf.remaining());
+        buf.put_slice(&self.get_mut().0.split_to(n));
+        Poll::Ready(Ok(()))
+    }
+}
+impl ResponseBody for FullBody {
+    fn content_type(&self) -> Cow<'static, str> {
+        self.1.clone()
+    }
+
+    fn length(&self) -> Option<u64> {
+        Some(self.0.len() as u64)
     }
 }
 

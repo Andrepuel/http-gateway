@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "http-file-explorer",
     "http-gateway",
     "http-todos",
 ]

@@ -1,11 +1,14 @@
 [package]
-name = "http-todos"
+name = "http-file-explorer"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+either = "1.15.0"
 http-gateway = { path = "../http-gateway" }
+infer = "0.19.0"
 serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.51.1", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
 uuid = { version = "1.23.0", features = ["serde", "v7"] }

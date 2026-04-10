@@ -1,0 +1,233 @@
+use either::Either;
+use http_gateway::{
+    bytes::{Bytes, BytesMut},
+    handler::{HttpResponse, Response, ResponseBody},
+    hyper::StatusCode,
+    router::{MakeRoute, RouterHandler},
+};
+use std::{
+    borrow::Cow,
+    collections::VecDeque,
+    io::{self, Read},
+    ops::Deref,
+    path::PathBuf,
+    task::Poll,
+};
+use tokio::sync::{mpsc, oneshot};
+
+fn main() {
+    let folder = std::path::absolute(std::env::current_dir().unwrap()).unwrap();
+    http_gateway::http_server_main(|| RouterHandler::new(Folder(folder, PathBuf::from(""))));
+}
+
+#[derive(Clone)]
+struct Folder(PathBuf, PathBuf);
+impl MakeRoute for Folder {
+    async fn register<R: http_gateway::router::Router<Self>>(router: &mut R) {
+        router
+            .route_recursive(async |self_, _, path| {
+                let absolute = self_.0.join(path.deref());
+                let relative = self_.1.join(path.deref());
+                if absolute.exists() {
+                    Some(Folder(absolute, relative))
+                } else {
+                    None
+                }
+            })
+            .await;
+
+        router
+            .get(async |self_, _| {
+                if self_.0.is_dir() {
+                    let mut html = HtmlFile::new();
+                    html.ul(|html| {
+                        let entries =
+                            self_.0.read_dir().unwrap().map(|entry| {
+                                entry.unwrap().file_name().to_string_lossy().into_owned()
+                            });
+                        for entry in entries {
+                            html.li(|html| {
+                                let link = self_.1.join(&entry);
+                                html.a(link.to_string_lossy().into_owned(), entry);
+                            });
+                        }
+                    });
+                    io::Result::Ok(Either::Left(html))
+                } else {
+                    let (emit_mime, on_mime) = oneshot::channel();
+                    let (emit_read, on_read) = mpsc::channel(1);
+                    let mut file = std::fs::File::open(self_.0)?;
+
+                    let runtime = tokio::runtime::Handle::current();
+                    tokio::task::spawn_blocking(move || {
+                        runtime.block_on(async move {
+                            let mut buf = BytesMut::new();
+                            buf.resize(8192, 0);
+
+                            match file.read(&mut buf) {
+                                Ok(n) => {
+                                    let read = buf.split_to(n);
+                                    let mime = infer::get(&read)
+                                        .map(|t| t.mime_type())
+                                        .unwrap_or_else(|| {
+                                            if std::str::from_utf8(&read).is_ok() {
+                                                "text/plain"
+                                            } else {
+                                                "application/octet-stream"
+                                            }
+                                        });
+                                    let _ = emit_mime.send(Ok(mime));
+                                    let _ = emit_read.send(Ok(read)).await;
+                                }
+                                Err(e) => {
+                                    let _ = emit_mime.send(Err(e));
+                                }
+                            }
+
+                            loop {
+                                if buf.len() < 4096 {
+                                    buf.resize(8192, 0);
+                                }
+
+                                match file.read(&mut buf) {
+                                    Ok(0) => {
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        if emit_read.send(Ok(buf.split_to(n))).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = emit_read.send(Err(e)).await;
+                                        break;
+                                    }
+                                }
+                            }
+                        })
+                    });
+
+                    let mime = on_mime.await.unwrap()?;
+                    Ok(Either::Right(HttpResponse::h200(ReadFileBody(
+                        on_read,
+                        mime,
+                        Default::default(),
+                    ))))
+                }
+            })
+            .await;
+    }
+}
+
+struct HtmlFile(VecDeque<Bytes>);
+impl HtmlFile {
+    fn new() -> HtmlFile {
+        HtmlFile(Default::default())
+    }
+
+    fn ul<F>(self: &mut HtmlFile, middle: F)
+    where
+        F: FnOnce(&mut HtmlFile),
+    {
+        self.0.push_back("<ul>".as_bytes().into());
+        middle(self);
+        self.0.push_back("</ul>".as_bytes().into());
+    }
+
+    fn li<F>(self: &mut HtmlFile, middle: F)
+    where
+        F: FnOnce(&mut HtmlFile),
+    {
+        self.0.push_back("<li>".as_bytes().into());
+        middle(self);
+        self.0.push_back("</li>".as_bytes().into());
+    }
+
+    fn a(self: &mut HtmlFile, link: String, text: String) {
+        self.0
+            .push_back(format!("<a href=\"{link}\">{text}</a>").into_bytes().into());
+    }
+}
+impl Response for HtmlFile {
+    type Body = Chunks;
+
+    fn status_code(&self) -> StatusCode {
+        StatusCode::OK
+    }
+
+    fn into_body(self) -> Self::Body {
+        Chunks(self.0)
+    }
+}
+
+struct Chunks(VecDeque<Bytes>);
+impl ResponseBody for Chunks {
+    fn content_type(&self) -> Cow<'static, str> {
+        Cow::Borrowed("text/html")
+    }
+
+    fn length(&self) -> Option<u64> {
+        Some(self.0.iter().map(|chunk| chunk.len() as u64).sum())
+    }
+}
+impl tokio::io::AsyncRead for Chunks {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        while buf.remaining() > 0 {
+            let Some(first) = self.0.front_mut() else {
+                break;
+            };
+
+            if first.is_empty() {
+                self.0.pop_front();
+                continue;
+            }
+
+            let n = first.len().min(buf.remaining());
+            buf.put_slice(&first.split_to(n));
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+struct ReadFileBody(mpsc::Receiver<io::Result<BytesMut>>, &'static str, BytesMut);
+impl ResponseBody for ReadFileBody {
+    fn content_type(&self) -> Cow<'static, str> {
+        Cow::Borrowed(self.1)
+    }
+
+    fn length(&self) -> Option<u64> {
+        None
+    }
+}
+impl tokio::io::AsyncRead for ReadFileBody {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        while buf.remaining() > 0 {
+            if self.2.is_empty() {
+                let p = self.0.poll_recv(cx);
+                return match p {
+                    Poll::Ready(Some(Ok(chunk))) => {
+                        self.2 = chunk;
+                        continue;
+                    }
+                    Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+                    Poll::Ready(None) => Poll::Ready(Ok(())),
+                    Poll::Pending => Poll::Pending,
+                };
+            }
+
+            let n = self.2.len().min(buf.remaining());
+            buf.put_slice(&self.2.split_to(n));
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
