@@ -8,7 +8,7 @@ use http_gateway::{
 use std::{
     borrow::Cow,
     collections::VecDeque,
-    io::{self, Read},
+    io::{self, Read, Seek},
     ops::Deref,
     path::PathBuf,
     task::Poll,
@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 
 fn main() {
     let folder = std::path::absolute(std::env::current_dir().unwrap()).unwrap();
-    http_gateway::http_server_main(|| RouterHandler::new(Folder(folder, PathBuf::from(""))));
+    http_gateway::http_server_main(|| RouterHandler::new(Folder(folder, PathBuf::from("/"))));
 }
 
 #[derive(Clone)]
@@ -28,6 +28,7 @@ impl MakeRoute for Folder {
             .route_recursive(async |self_, _, path| {
                 let absolute = self_.0.join(path.deref());
                 let relative = self_.1.join(path.deref());
+                tracing::debug!(?absolute, ?relative);
                 if absolute.exists() {
                     Some(Folder(absolute, relative))
                 } else {
@@ -61,6 +62,20 @@ impl MakeRoute for Folder {
                     let runtime = tokio::runtime::Handle::current();
                     tokio::task::spawn_blocking(move || {
                         runtime.block_on(async move {
+                            let len = (|| {
+                                let len = file.seek(io::SeekFrom::End(0))?;
+                                file.seek(io::SeekFrom::Start(0))?;
+                                io::Result::Ok(len)
+                            })();
+
+                            let len = match len {
+                                Ok(len) => len,
+                                Err(e) => {
+                                    let _ = emit_mime.send(Err(e));
+                                    return;
+                                }
+                            };
+
                             let mut buf = BytesMut::new();
                             buf.resize(8192, 0);
 
@@ -76,7 +91,7 @@ impl MakeRoute for Folder {
                                                 "application/octet-stream"
                                             }
                                         });
-                                    let _ = emit_mime.send(Ok(mime));
+                                    let _ = emit_mime.send(Ok((mime, len)));
                                     let _ = emit_read.send(Ok(read)).await;
                                 }
                                 Err(e) => {
@@ -107,11 +122,13 @@ impl MakeRoute for Folder {
                         })
                     });
 
-                    let mime = on_mime.await.unwrap()?;
+                    let (mime, len) = on_mime.await.unwrap()?;
+                    tracing::debug!(?mime, ?len);
                     Ok(Either::Right(HttpResponse::h200(ReadFileBody(
                         on_read,
                         mime,
                         Default::default(),
+                        len,
                     ))))
                 }
             })
@@ -194,14 +211,19 @@ impl tokio::io::AsyncRead for Chunks {
     }
 }
 
-struct ReadFileBody(mpsc::Receiver<io::Result<BytesMut>>, &'static str, BytesMut);
+struct ReadFileBody(
+    mpsc::Receiver<io::Result<BytesMut>>,
+    &'static str,
+    BytesMut,
+    u64,
+);
 impl ResponseBody for ReadFileBody {
     fn content_type(&self) -> Cow<'static, str> {
         Cow::Borrowed(self.1)
     }
 
     fn length(&self) -> Option<u64> {
-        None
+        Some(self.3)
     }
 }
 impl tokio::io::AsyncRead for ReadFileBody {
@@ -210,6 +232,7 @@ impl tokio::io::AsyncRead for ReadFileBody {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let mut has_written = false;
         while buf.remaining() > 0 {
             if self.2.is_empty() {
                 let p = self.0.poll_recv(cx);
@@ -220,12 +243,15 @@ impl tokio::io::AsyncRead for ReadFileBody {
                     }
                     Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
                     Poll::Ready(None) => Poll::Ready(Ok(())),
+                    Poll::Pending if has_written => Poll::Ready(Ok(())),
                     Poll::Pending => Poll::Pending,
                 };
             }
 
             let n = self.2.len().min(buf.remaining());
+            self.3 -= n as u64;
             buf.put_slice(&self.2.split_to(n));
+            has_written = true;
         }
 
         Poll::Ready(Ok(()))

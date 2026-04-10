@@ -6,7 +6,7 @@ pub mod tokio_hyper;
 pub mod uri_subject;
 
 use crate::{
-    handler::{Handler, NoBody, Request, Response, ResponseBody, StringId},
+    handler::{EitherBody, Handler, NoBody, Request, Response, ResponseBody, StringId},
     tokio_hyper::TokioHyper,
 };
 use bytes::BytesMut;
@@ -18,6 +18,7 @@ use hyper::{
     header::{HeaderName, HeaderValue},
     service::service_fn,
 };
+use pin_project::pin_project;
 use std::{
     collections::HashMap, future::poll_fn, io, pin::Pin, rc::Rc, str::FromStr, sync::Arc,
     task::Poll,
@@ -137,7 +138,7 @@ async fn service_http<H>(
     reqid: Arc<str>,
     handler: H,
     req: hyper::Request<Incoming>,
-) -> io::Result<hyper::Response<WriteBody>>
+) -> io::Result<hyper::Response<WriteBody<EitherBody<<H::Response as Response>::Body, NoBody>>>>
 where
     H: Handler,
 {
@@ -220,7 +221,7 @@ where
     let content_type = response.content_type();
 
     let mut response = hyper::Response::new(WriteBody {
-        write: Box::pin(response),
+        write: response,
         buf: Default::default(),
     });
     *response.status_mut() = status;
@@ -242,26 +243,30 @@ where
     Ok(response)
 }
 
-struct WriteBody {
-    write: Pin<Box<dyn ResponseBody>>,
+#[pin_project]
+struct WriteBody<R> {
+    #[pin]
+    write: R,
     buf: BytesMut,
 }
-impl hyper::body::Body for WriteBody {
+impl<R> hyper::body::Body for WriteBody<R>
+where
+    R: ResponseBody,
+{
     type Data = BytesMut;
     type Error = io::Error;
 
     fn poll_frame(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-        if self.buf.len() < 4096 {
-            self.buf.resize(8192, 0);
+        let self_ = self.project();
+        if self_.buf.len() < 4096 {
+            self_.buf.resize(8192, 0);
         }
 
-        let self_ = self.get_mut();
-        let write = self_.write.as_mut();
-        let mut buf = ReadBuf::new(&mut self_.buf);
-        match AsyncRead::poll_read(write, cx, &mut buf) {
+        let mut buf = ReadBuf::new(self_.buf);
+        match AsyncRead::poll_read(self_.write, cx, &mut buf) {
             Poll::Ready(Ok(())) => match buf.filled().len() {
                 0 => Poll::Ready(None),
                 n => Poll::Ready(Some(Ok(hyper::body::Frame::data(self_.buf.split_to(n))))),

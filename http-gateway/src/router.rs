@@ -821,20 +821,18 @@ impl RouterResponse {
 }
 impl Response for RouterResponse {
     type Body = Pin<Box<dyn ResponseBody>>;
-    
+
     fn status_code(&self) -> StatusCode {
         self.boxed.status_code()
     }
-    
+
     fn into_body(self) -> Self::Body {
         self.boxed.into_body()
     }
-    
+
     fn extra_headers(&self) -> HashMap<StringId, String> {
         self.boxed.extra_headers()
     }
-
-    
 }
 
 struct EmptyResponse(StatusCode);
@@ -844,7 +842,7 @@ impl Response for EmptyResponse {
     fn status_code(&self) -> StatusCode {
         self.0
     }
-    
+
     fn into_body(self) -> Self::Body {
         NoBody
     }
