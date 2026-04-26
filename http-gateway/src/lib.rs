@@ -36,7 +36,7 @@ pub use serde_json;
 
 pub fn http_server_main<F, H>(handler: F)
 where
-    F: FnOnce() -> H,
+    F: AsyncFnOnce() -> H,
     H: Handler<Incoming> + 'static,
 {
     let r = dotenvy::dotenv();
@@ -56,7 +56,7 @@ where
                 .parse()
                 .map_err(|e| io::Error::other(format!("Bad LISTEN url ({listen:?}): {e}")))?;
 
-            http_server(listen, handler())
+            http_server(listen, handler().await)
                 .instrument(tracing::info_span!("server"))
                 .await
         });

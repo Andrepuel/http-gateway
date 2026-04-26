@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 
 fn main() {
     let folder = std::path::absolute(std::env::current_dir().unwrap()).unwrap();
-    http_gateway::http_server_main(|| RouterHandler::new(Folder(folder, PathBuf::from("/"))));
+    http_gateway::http_server_main(async || RouterHandler::new(Folder(folder, PathBuf::from("/"))));
 }
 
 #[derive(Clone)]

@@ -21,7 +21,7 @@ fn main() {
     .into_iter()
     .collect();
 
-    http_server_main(|| {
+    http_server_main(async || {
         RouterHandler::new(ApiRoot {
             db: Rc::new(RefCell::new(db)),
         })

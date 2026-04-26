@@ -5,7 +5,7 @@ use http_gateway::{
 use std::{collections::HashMap, io};
 
 fn main() {
-    http_gateway::http_server_main(|| RouterHandler::new(AuthRouter));
+    http_gateway::http_server_main(async || RouterHandler::new(AuthRouter));
 }
 
 #[derive(Clone, Copy)]
