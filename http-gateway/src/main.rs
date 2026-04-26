@@ -1,8 +1,8 @@
 use http_gateway::{
-    handler::{Authorization, Json200, StringId},
+    handler::{Authorization, Json, StringId},
     router::{self, MakeRoute, RouterHandler},
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, io};
 
 fn main() {
     http_gateway::http_server_main(|| RouterHandler::new(AuthRouter));
@@ -44,15 +44,16 @@ impl MakeRoute for EchoRouter {
             .await;
 
         router
-            .any_leaf(async |self_, req| {
-                Json200(EchoResponse {
+            .any_leaf(async |self_, mut req| {
+                let body = req.collect_body().await.map_err(io::Error::other)?;
+                io::Result::Ok(Json::j200(EchoResponse {
                     auth: self_.auth.map(|auth| (auth.scheme, auth.params)),
                     method: req.method.to_string(),
                     path: self_.path,
                     headers: req.headers,
                     query: req.query,
-                    body: req.body,
-                })
+                    body: serde_json::from_slice(&body).map_err(|e| e.to_string()),
+                }))
             })
             .await;
     }
@@ -65,5 +66,5 @@ struct EchoResponse {
     pub path: Vec<StringId>,
     pub headers: HashMap<StringId, String>,
     pub query: HashMap<StringId, String>,
-    pub body: Option<serde_json::Value>,
+    pub body: Result<serde_json::Value, String>,
 }

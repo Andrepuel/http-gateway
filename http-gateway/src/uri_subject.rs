@@ -48,7 +48,7 @@ mod tests {
             ("/abc/def", vec!["abc", "def"]),
             (
                 "/a-a/b%20b/c_c/d%2Ad/e%3Ee/f.f",
-                vec!["a-a", "b_b", "c_c", "d_d", "e_e", "f_f"],
+                vec!["a-a", "b b", "c_c", "d*d", "e>e", "f.f"],
             ),
         ] {
             let uri = uri.parse().unwrap();

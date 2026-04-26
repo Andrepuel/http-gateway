@@ -11,7 +11,6 @@ use crate::{
 };
 use bytes::BytesMut;
 use futures::pin_mut;
-use http_body_util::BodyExt;
 use hyper::{
     StatusCode,
     body::Incoming,
@@ -38,7 +37,7 @@ pub use serde_json;
 pub fn http_server_main<F, H>(handler: F)
 where
     F: FnOnce() -> H,
-    H: Handler + 'static,
+    H: Handler<Incoming> + 'static,
 {
     let r = dotenvy::dotenv();
     tracing_subscriber::fmt::init();
@@ -73,7 +72,7 @@ where
 
 pub async fn http_server<H>(listen: Url, handler: H) -> io::Result<Never>
 where
-    H: Handler + 'static,
+    H: Handler<Incoming> + 'static,
 {
     let listen = (
         listen
@@ -140,19 +139,13 @@ async fn service_http<H>(
     req: hyper::Request<Incoming>,
 ) -> io::Result<hyper::Response<WriteBody<EitherBody<<H::Response as Response>::Body, NoBody>>>>
 where
-    H: Handler,
+    H: Handler<Incoming>,
 {
-    let mut content_type = None;
     let mut headers = HashMap::new();
     for (name, value) in req.headers() {
         let Ok(value) = value.to_str() else {
             continue;
         };
-
-        if name.as_str().eq_ignore_ascii_case("content-type") {
-            tracing::debug!(content_type=?value);
-            content_type = Some(value.to_ascii_lowercase());
-        }
 
         if name.as_str().eq_ignore_ascii_case("req-id") {
             continue;
@@ -161,38 +154,11 @@ where
         headers.insert(StringId::new(name.as_str()), value.to_string());
     }
 
-    let content_type = content_type.unwrap_or_default();
     let subject = uri_subject::uri_to_path(req.uri().clone());
     tracing::debug!(?subject);
     let method = req.method().clone();
     let query = uri_subject::uri_to_query(req.uri());
-    let body = req
-        .into_body()
-        .collect()
-        .await
-        .map_err(io::Error::other)?
-        .to_bytes();
-    let body = match content_type.as_str() {
-        "application/json" => {
-            let json = std::str::from_utf8(&body)
-                .map_err(|e| {
-                    tracing::warn!(%e, "bad UTF8 json body");
-                    tracing::debug!(?e);
-                })
-                .and_then(|body| {
-                    serde_json::from_str(body).map_err(|e| {
-                        tracing::warn!(%e, "bad json body");
-                        tracing::debug!(?e);
-                    })
-                });
-
-            match json {
-                Ok(json) => json,
-                Err(()) => serde_json::Value::Null,
-            }
-        }
-        _ => serde_json::Value::Null,
-    };
+    let body = req.into_body();
 
     let response = handler
         .handle(Request {
@@ -200,7 +166,7 @@ where
             path: subject,
             headers,
             query,
-            body: Some(body),
+            body,
         })
         .instrument(tracing::info_span!("handler", ?reqid));
     pin_mut!(response);

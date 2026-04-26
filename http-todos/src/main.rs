@@ -1,13 +1,13 @@
 #![recursion_limit = "256"]
 
 use http_gateway::{
-    handler::{Json, Response, StringId},
+    handler::{Json, Json201, ResourceLocation, Response, StringId},
     http_server_main,
     hyper::StatusCode,
-    router::{MakeRoute, Router, RouterHandler},
+    router::{MakeRoute, Router, RouterHandler, ext::RouterExt},
     serde_json,
 };
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{borrow::Cow, cell::RefCell, collections::BTreeMap, convert::Infallible, rc::Rc};
 use uuid::Uuid;
 
 fn main() {
@@ -74,10 +74,8 @@ impl MakeRoute for TasksDbRoute {
             .await;
 
         router
-            .post(async |self_, req| {
+            .post_body(async |self_, new_task: NewTask, _| {
                 let id = Uuid::now_v7();
-                let new_task: NewTask =
-                    serde_json::from_value(req.body.unwrap_or_default()).map_err(Error422::from)?;
                 let new_task = TodoTask::from(new_task);
                 self_
                     .db
@@ -85,7 +83,7 @@ impl MakeRoute for TasksDbRoute {
                     .insert(id, Rc::new(RefCell::new(new_task.clone())));
 
                 // TODO 201 with location
-                Result::<_, Error422>::Ok(Json::j200(TodoTaskOut::from((id, new_task))))
+                Result::<_, Error422>::Ok(Json201(TodoTaskOut::from((id, new_task))))
             })
             .await;
 
@@ -127,35 +125,25 @@ impl MakeRoute for ExistentTask {
             .await;
 
         router
-            .get_path("title", async |self_, _| {
-                Json::j200(self_.task.borrow().title.clone())
-            })
+            .attribute::<Infallible, _, _, _, _>(
+                "title",
+                async |self_, title| {
+                    self_.task.borrow_mut().title = title;
+                    Ok(())
+                },
+                async |self_| Ok(self_.task.borrow().title.clone()),
+            )
             .await;
 
         router
-            .put_path("title", async |self_, req| {
-                let title: String = serde_json::from_value(req.body.take().unwrap_or_default())
-                    .map_err(Error422::from)?;
-                self_.task.borrow_mut().title = title.clone();
-
-                Result::<_, Error422>::Ok(Json::j200(title))
-            })
-            .await;
-
-        router
-            .get_path("done", async |self_, _| {
-                Json::j200(self_.task.borrow().done)
-            })
-            .await;
-
-        router
-            .put_path("done", async |self_, req| {
-                let done: bool = serde_json::from_value(req.body.take().unwrap_or_default())
-                    .map_err(Error422::from)?;
-                self_.task.borrow_mut().done = done;
-
-                Result::<_, Error422>::Ok(Json::j200(done))
-            })
+            .attribute::<Infallible, _, _, _, _>(
+                "done",
+                async |self_, done| {
+                    self_.task.borrow_mut().done = done;
+                    Ok(())
+                },
+                async |self_| Ok(self_.task.borrow().done),
+            )
             .await;
     }
 }
@@ -165,6 +153,15 @@ struct TodoTaskOut {
     pub id: Uuid,
     pub title: String,
     pub done: bool,
+}
+impl ResourceLocation for TodoTaskOut {
+    fn base() -> &'static str {
+        "/tasks/"
+    }
+
+    fn resource_id(&self) -> Cow<'_, str> {
+        Cow::Owned(self.id.to_string())
+    }
 }
 impl From<(Uuid, TodoTask)> for TodoTaskOut {
     fn from((id, TodoTask { title, done }): (Uuid, TodoTask)) -> Self {

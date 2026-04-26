@@ -1,6 +1,14 @@
+use bytes::{Bytes, BytesMut};
+use either::Either;
+use hyper::{
+    Method, StatusCode,
+    body::{Body, Incoming},
+};
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
+    convert::Infallible,
+    future::poll_fn,
     hash::Hash,
     io,
     ops::Deref,
@@ -8,18 +16,51 @@ use std::{
     rc::Rc,
     task::{Context, Poll},
 };
-
-use either::Either;
-use hyper::{Method, StatusCode};
 use tokio::io::AsyncRead;
 
 #[derive(Debug)]
-pub struct Request {
+pub struct Request<B> {
     pub method: Method,
     pub path: VecDeque<StringId>,
     pub headers: HashMap<StringId, String>,
     pub query: HashMap<StringId, String>,
-    pub body: Option<serde_json::Value>,
+    pub body: B,
+}
+impl Request<Incoming> {
+    pub async fn collect_body(&mut self) -> Result<BytesMut, hyper::Error> {
+        let mut r = BytesMut::new();
+        loop {
+            let frame = match poll_fn(|cx| Pin::new(&mut self.body).poll_frame(cx)).await {
+                Some(Ok(frame)) => frame,
+
+                Some(Err(e)) => return Err(e),
+                None => break,
+            };
+
+            if let Ok(data) = frame.into_data() {
+                r.extend_from_slice(&data);
+            }
+        }
+
+        Ok(r)
+    }
+
+    pub async fn next_chunk(&mut self) -> Result<Bytes, hyper::Error> {
+        poll_fn(|cx| {
+            loop {
+                break match Pin::new(&mut self.body).poll_frame(cx) {
+                    Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                        Ok(data) => Poll::Ready(Ok(data)),
+                        Err(_) => continue,
+                    },
+                    Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+                    Poll::Ready(None) => Poll::Ready(Ok(Bytes::new())),
+                    Poll::Pending => Poll::Pending,
+                };
+            }
+        })
+        .await
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -42,15 +83,15 @@ impl From<String> for Authorization {
     }
 }
 
-pub trait Handler {
+pub trait Handler<B> {
     type Response: Response;
 
-    fn handle(&self, req: Request) -> impl Future<Output = Self::Response>;
+    fn handle(&self, req: Request<B>) -> impl Future<Output = Self::Response>;
 }
-impl<H: Handler> Handler for Rc<H> {
+impl<B, H: Handler<B>> Handler<B> for Rc<H> {
     type Response = H::Response;
 
-    fn handle(&self, req: Request) -> impl Future<Output = Self::Response> {
+    fn handle(&self, req: Request<B>) -> impl Future<Output = Self::Response> {
         H::handle(self, req)
     }
 }
@@ -68,6 +109,8 @@ impl Response for io::Error {
     type Body = NoBody;
 
     fn into_body(self) -> Self::Body {
+        tracing::error!(e=%self, "Internal server error");
+        tracing::debug!(e=?self);
         NoBody
     }
 
@@ -158,6 +201,17 @@ where
         self.as_ref()
             .map(Response::extra_headers)
             .unwrap_or_default()
+    }
+}
+impl Response for Infallible {
+    type Body = NoBody;
+
+    fn status_code(&self) -> StatusCode {
+        unreachable!()
+    }
+
+    fn into_body(self) -> Self::Body {
+        unreachable!()
     }
 }
 
@@ -292,8 +346,8 @@ impl<T: serde::Serialize + 'static> Response for Json<T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Json201<T>(pub T, String);
-impl<T: serde::Serialize + 'static> Response for Json201<T> {
+pub struct Json201<T>(pub T);
+impl<T: serde::Serialize + ResourceLocation + 'static> Response for Json201<T> {
     type Body = FullBody;
 
     fn status_code(&self) -> StatusCode {
@@ -306,10 +360,21 @@ impl<T: serde::Serialize + 'static> Response for Json201<T> {
     }
 
     fn extra_headers(&self) -> HashMap<StringId, String> {
-        [(StringId::from("Location"), self.1.clone())]
+        [(StringId::from("Location"), self.0.location())]
             .into_iter()
             .collect()
     }
+}
+
+pub trait ResourceLocation {
+    fn location(&self) -> String {
+        let mut out = Self::base().to_string();
+        out.push_str(&self.resource_id());
+        out
+    }
+
+    fn base() -> &'static str;
+    fn resource_id(&self) -> Cow<'_, str>;
 }
 
 pub struct Empty404;

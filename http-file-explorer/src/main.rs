@@ -1,14 +1,14 @@
 use either::Either;
 use http_gateway::{
     bytes::{Bytes, BytesMut},
-    handler::{HttpResponse, Response, ResponseBody},
-    hyper::StatusCode,
+    handler::{HttpResponse, Json, Json201, ResourceLocation, Response, ResponseBody},
+    hyper::{Method, StatusCode},
     router::{MakeRoute, RouterHandler},
 };
 use std::{
     borrow::Cow,
     collections::VecDeque,
-    io::{self, Read, Seek},
+    io::{self, Read, Seek, Write},
     ops::Deref,
     path::PathBuf,
     task::Poll,
@@ -24,6 +24,13 @@ fn main() {
 struct Folder(PathBuf, PathBuf);
 impl MakeRoute for Folder {
     async fn register<R: http_gateway::router::Router<Self>>(router: &mut R) {
+        router
+            .middleware_if(
+                |_, req| req.method == Method::POST || req.method == Method::PUT,
+                async |self_, _req| EditFile(self_.0, self_.1),
+            )
+            .await;
+
         router
             .route_recursive(async |self_, _, path| {
                 let absolute = self_.0.join(path.deref());
@@ -133,6 +140,88 @@ impl MakeRoute for Folder {
                 }
             })
             .await;
+    }
+}
+
+#[derive(Clone)]
+struct EditFile(PathBuf, PathBuf);
+impl MakeRoute for EditFile {
+    async fn register<
+        R: http_gateway::router::Router<Self, http_gateway::hyper::body::Incoming>,
+    >(
+        router: &mut R,
+    ) {
+        router
+            .route_recursive(async |self_, _, path| {
+                let absolute = self_.0.join(path.deref());
+                let relative = self_.1.join(path.deref());
+                tracing::debug!(?absolute, ?relative);
+                Some(EditFile(absolute, relative))
+            })
+            .await;
+
+        router
+            .post(async |self_, mut req| {
+                let mut i = 0;
+                let (name, relative) = loop {
+                    let newfile = format!("newfile{i}");
+                    let name = self_.0.join(&newfile);
+                    if name.exists() {
+                        i += 1;
+                        continue;
+                    }
+                    break (name, self_.1.join(newfile));
+                };
+
+                if let Some(dir) = name.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+
+                let mut file = std::fs::File::create(&name)?;
+                loop {
+                    let chunk = req.next_chunk().await.map_err(io::Error::other)?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    file.write_all(&chunk)?;
+                }
+
+                io::Result::Ok(Json201(NewFile { path: relative }))
+            })
+            .await;
+
+        router
+            .put(async |self_, mut req| {
+                if let Some(dir) = self_.0.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+
+                let mut file = std::fs::File::create(&self_.0)?;
+                loop {
+                    let chunk = req.next_chunk().await.map_err(io::Error::other)?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    file.write_all(&chunk)?;
+                }
+
+                io::Result::Ok(Json::j200(()))
+            })
+            .await;
+    }
+}
+
+#[derive(serde::Serialize)]
+struct NewFile {
+    path: PathBuf,
+}
+impl ResourceLocation for NewFile {
+    fn base() -> &'static str {
+        ""
+    }
+
+    fn resource_id(&self) -> Cow<'_, str> {
+        self.path.to_string_lossy()
     }
 }
 
