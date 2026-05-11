@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod ext;
 
 use crate::handler::{Empty404, Handler, NoBody, Request, Response, ResponseBody, StringId};
@@ -31,14 +32,14 @@ where
             async fn middleware_mut_map<'a, I, T2, F, U, P>(&mut self, if_: I, f: F, post: P)
             where
                 T2: 'a,
-                I: FnOnce(R, &Request<B>) -> Then<T2, R>,
+                I: FnOnce(R, &mut Request<B>) -> Then<T2, R>,
                 F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
                 U: MakeRoute<B> + 'a,
                 P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
             {
                 self.0
                     .execute_map(
-                        |(root, req)| match if_(root, &req) {
+                        |(root, mut req)| match if_(root, &mut req) {
                             Then::Then(t2) => Then::Then((t2, req)),
                             Then::Else(root) => Then::Else((root, req)),
                         },
@@ -144,7 +145,7 @@ where
                         _post: P,
                     ) where
                         T2: 'a,
-                        I: FnOnce(R, &Request<B>) -> Then<T2, R>,
+                        I: FnOnce(R, &mut Request<B>) -> Then<T2, R>,
                         F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
                         U: MakeRoute<B> + 'a,
                         P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
@@ -197,7 +198,7 @@ where
                         _post: P,
                     ) where
                         T2: 'a,
-                        I: FnOnce(R, &Request<B>) -> Then<T2, R>,
+                        I: FnOnce(R, &mut Request<B>) -> Then<T2, R>,
                         F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
                         U: MakeRoute<B> + 'a,
                         P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
@@ -259,7 +260,7 @@ where
                                     _post: P,
                                 ) where
                                     T2: 'a,
-                                    I: FnOnce(R, &Request<B>) -> Then<T2, R>,
+                                    I: FnOnce(R, &mut Request<B>) -> Then<T2, R>,
                                     F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
                                     U: MakeRoute<B> + 'a,
                                     P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
@@ -329,7 +330,7 @@ pub trait Router<T, B = Incoming> {
     ) -> impl Future<Output = ()>
     where
         T2: 'a,
-        I: FnOnce(T, &Request<B>) -> Then<T2, T>,
+        I: FnOnce(T, &mut Request<B>) -> Then<T2, T>,
         F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
         U: MakeRoute<B> + 'a,
         P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse;
@@ -379,6 +380,23 @@ pub trait RouterDerived<T, B>: Router<T, B> {
                 async |_self_, res| res,
             )
             .await
+        }
+    }
+
+    fn middleware_map<I, T2, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
+    where
+        I: FnOnce(T, &mut Request<B>) -> Then<T2, T>,
+        F: AsyncFnOnce(T2, &mut Request<B>) -> U,
+        U: MakeRoute<B>,
+    {
+        async move {
+            self.middleware_mut_map(
+                |self_, req| if_(self_, req).map(Some),
+                async |self_, req| {
+                    f(self_.take().unwrap(), req).await
+                },
+                async |_, res| res,
+            ).await
         }
     }
 
@@ -656,7 +674,7 @@ where
             async fn middleware_mut_map<'a, I, T2, F, U, P>(&mut self, if_: I, f: F, post: P)
             where
                 T2: 'a,
-                I: FnOnce(T, &Request<B>) -> Then<T2, T>,
+                I: FnOnce(T, &mut Request<B>) -> Then<T2, T>,
                 F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
                 U: MakeRoute<B> + 'a,
                 P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
@@ -804,7 +822,7 @@ where
             async fn middleware_mut_map<'a, I, T2, F, U, P>(&mut self, if_: I, f: F, post: P)
             where
                 T2: 'a,
-                I: FnOnce(T, &Request<B>) -> Then<T2, T>,
+                I: FnOnce(T, &mut Request<B>) -> Then<T2, T>,
                 F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
                 U: MakeRoute<B> + 'a,
                 P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
@@ -946,7 +964,7 @@ where
             async fn middleware_mut_map<'a, I, T2, F, U, P>(&mut self, if_: I, f: F, post: P)
             where
                 T2: 'a,
-                I: FnOnce(T, &Request<B>) -> Then<T2, T>,
+                I: FnOnce(T, &mut Request<B>) -> Then<T2, T>,
                 F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
                 U: MakeRoute<B> + 'a,
                 P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
