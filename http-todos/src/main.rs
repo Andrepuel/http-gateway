@@ -4,7 +4,7 @@ use http_gateway::{
     handler::{Json, Json201, ResourceLocation, Response, StringId},
     http_server_main,
     hyper::StatusCode,
-    router::{MakeRoute, Router, RouterHandler, ext::RouterExt},
+    router::{MakeRoute, Router, RouterDerived, RouterHandler, ext::RouterExt},
     serde_json,
 };
 use std::{borrow::Cow, cell::RefCell, collections::BTreeMap, convert::Infallible, rc::Rc};

@@ -28,22 +28,56 @@ where
     async fn do_handle(root: R, req: Request<B>) -> RouterResponse {
         struct FindMiddleware<B, R>(RouterState<(R, Request<B>)>);
         impl<B, R> Router<R, B> for FindMiddleware<B, R> {
-            async fn middleware_if<I, F, U>(&mut self, if_: I, f: F)
+            async fn middleware_mut_map<'a, I, T2, F, U, P>(&mut self, if_: I, f: F, post: P)
             where
-                I: FnOnce(&R, &Request<B>) -> bool,
-                F: AsyncFnOnce(R, &mut Request<B>) -> U,
-                U: MakeRoute<B>,
+                T2: 'a,
+                I: FnOnce(R, &Request<B>) -> Then<T2, R>,
+                F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
+                U: MakeRoute<B> + 'a,
+                P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
             {
                 self.0
-                    .execute_if(
-                        |(root, req)| if_(root, req),
-                        async |(root, mut req)| {
-                            let route = f(root, &mut req).await;
-
-                            RouterHandler::<B, U>::do_handle(route, req).await
+                    .execute_map(
+                        |(root, req)| match if_(root, &req) {
+                            Then::Then(t2) => Then::Then((t2, req)),
+                            Then::Else(root) => Then::Else((root, req)),
+                        },
+                        async |(mut root, mut req)| {
+                            let response = {
+                                let root = unsafe {
+                                    std::mem::transmute::<&mut T2, &'a mut T2>(&mut root)
+                                };
+                                let route = f(root, &mut req).await;
+                                RouterHandler::<B, U>::do_handle(route, req).await
+                            };
+                            post(root, response).await
                         },
                     )
                     .await;
+            }
+
+            async fn route_map<I, T2, F, U>(&mut self, _if_: I, _f: F)
+            where
+                I: FnOnce(R, &Request<B>, &StringId) -> Then<T2, R>,
+                F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
+                U: MakeRoute<B>,
+            {
+            }
+
+            async fn route_map_recursive<I, T2, F, U>(&mut self, _if_: I, _f: F)
+            where
+                I: FnOnce(R, &StringId) -> Then<T2, R>,
+                F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
+                U: MakeRoute<B>,
+            {
+            }
+
+            async fn leaf_map<I, T2, F, U>(&mut self, _if_: I, _f: F)
+            where
+                I: FnOnce(R, &Method) -> Then<T2, R>,
+                F: AsyncFnOnce(T2, Request<B>) -> U,
+                U: Response,
+            {
             }
         }
         let mut middleware = FindMiddleware((root, req).into());
@@ -59,15 +93,18 @@ where
             Some(path) => {
                 struct FindRoute<B, R>(RouterState<(StringId, R, Request<B>)>);
                 impl<B, R> Router<R, B> for FindRoute<B, R> {
-                    async fn route_if<I, F, U>(&mut self, if_: I, f: F)
+                    async fn route_map<I, R2, F, U>(&mut self, if_: I, f: F)
                     where
-                        I: FnOnce(&R, &Request<B>, &StringId) -> bool,
-                        F: AsyncFnOnce(R, &mut Request<B>, StringId) -> U,
+                        I: FnOnce(R, &Request<B>, &StringId) -> Then<R2, R>,
+                        F: AsyncFnOnce(R2, &mut Request<B>, StringId) -> U,
                         U: MakeRoute<B>,
                     {
                         self.0
-                            .execute_if(
-                                |(req_path, root, req)| if_(root, req, req_path),
+                            .execute_map(
+                                |(req_path, root, req)| match if_(root, &req, &req_path) {
+                                    Then::Then(root2) => Then::Then((req_path, root2, req)),
+                                    Then::Else(root) => Then::Else((req_path, root, req)),
+                                },
                                 async |(path, root, mut req)| {
                                     let route = f(root, &mut req, path).await;
 
@@ -77,15 +114,18 @@ where
                             .await;
                     }
 
-                    async fn route_if_recursive<I, F, U>(&mut self, if_: I, f: F)
+                    async fn route_map_recursive<I, R2, F, U>(&mut self, if_: I, f: F)
                     where
-                        I: FnOnce(&R, &StringId) -> bool,
-                        F: AsyncFnOnce(R, &mut Request<B>, StringId) -> U,
+                        I: FnOnce(R, &StringId) -> Then<R2, R>,
+                        F: AsyncFnOnce(R2, &mut Request<B>, StringId) -> U,
                         U: MakeRoute<B>,
                     {
                         self.0
-                            .execute_if(
-                                |(req_path, root, _)| if_(root, req_path),
+                            .execute_map(
+                                |(req_path, root, req)| match if_(root, &req_path) {
+                                    Then::Then(root2) => Then::Then((req_path, root2, req)),
+                                    Then::Else(root) => Then::Else((req_path, root, req)),
+                                },
                                 async |(path, root, mut req)| {
                                     let route = f(root, &mut req, path).await;
 
@@ -95,6 +135,28 @@ where
                                 },
                             )
                             .await;
+                    }
+
+                    async fn middleware_mut_map<'a, I, T2, F, U, P>(
+                        &mut self,
+                        _if_: I,
+                        _f: F,
+                        _post: P,
+                    ) where
+                        T2: 'a,
+                        I: FnOnce(R, &Request<B>) -> Then<T2, R>,
+                        F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
+                        U: MakeRoute<B> + 'a,
+                        P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
+                    {
+                    }
+
+                    async fn leaf_map<I, T2, F, U>(&mut self, _if_: I, _f: F)
+                    where
+                        I: FnOnce(R, &Method) -> Then<T2, R>,
+                        F: AsyncFnOnce(T2, Request<B>) -> U,
+                        U: Response,
+                    {
                     }
                 }
 
@@ -111,18 +173,51 @@ where
             None => {
                 struct MakeRouteLeaf<B, R>(RouterState<(R, Request<B>)>);
                 impl<B, R> Router<R, B> for MakeRouteLeaf<B, R> {
-                    async fn leaf_if<I, F, U>(&mut self, if_: I, f: F)
+                    async fn leaf_map<I, R2, F, U>(&mut self, if_: I, f: F)
                     where
-                        I: FnOnce(&R, &Method) -> bool,
-                        F: AsyncFnOnce(R, Request<B>) -> U,
+                        I: FnOnce(R, &Method) -> Then<R2, R>,
+                        F: AsyncFnOnce(R2, Request<B>) -> U,
                         U: Response,
                     {
                         self.0
-                            .execute_if(
-                                |(root, req)| if_(root, &req.method),
+                            .execute_map(
+                                |(root, req)| match if_(root, &req.method) {
+                                    Then::Then(root2) => Then::Then((root2, req)),
+                                    Then::Else(root) => Then::Else((root, req)),
+                                },
                                 async |(root, req)| RouterResponse::new(f(root, req).await),
                             )
                             .await;
+                    }
+
+                    async fn middleware_mut_map<'a, I, T2, F, U, P>(
+                        &mut self,
+                        _if_: I,
+                        _f: F,
+                        _post: P,
+                    ) where
+                        T2: 'a,
+                        I: FnOnce(R, &Request<B>) -> Then<T2, R>,
+                        F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
+                        U: MakeRoute<B> + 'a,
+                        P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
+                    {
+                    }
+
+                    async fn route_map<I, T2, F, U>(&mut self, _if_: I, _f: F)
+                    where
+                        I: FnOnce(R, &Request<B>, &StringId) -> Then<T2, R>,
+                        F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
+                        U: MakeRoute<B>,
+                    {
+                    }
+
+                    async fn route_map_recursive<I, T2, F, U>(&mut self, _if_: I, _f: F)
+                    where
+                        I: FnOnce(R, &StringId) -> Then<T2, R>,
+                        F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
+                        U: MakeRoute<B>,
+                    {
                     }
                 }
                 let mut call = MakeRouteLeaf((root, req).into());
@@ -130,8 +225,10 @@ where
 
                 match call.0.take() {
                     Either::Right(r) => r,
-                    Either::Left((mut root, req)) => {
-                        let mut other_methods = Vec::new();
+                    Either::Left((root, req)) => {
+                        let mut other_method = None;
+                        let mut root = Some(root);
+
                         for method in [
                             Method::HEAD,
                             Method::GET,
@@ -139,35 +236,69 @@ where
                             Method::POST,
                             Method::DELETE,
                         ] {
-                            struct FindOtherMethods<R>(Method, bool, R);
+                            struct FindOtherMethods<R>(Method, bool, Option<R>);
                             impl<B, R> Router<R, B> for FindOtherMethods<R> {
-                                async fn leaf_if<I, F, U>(&mut self, if_: I, _f: F)
+                                async fn leaf_map<I, R2, F, U>(&mut self, if_: I, _f: F)
                                 where
-                                    I: FnOnce(&R, &Method) -> bool,
-                                    F: AsyncFnOnce(R, Request<B>) -> U,
+                                    I: FnOnce(R, &Method) -> Then<R2, R>,
+                                    F: AsyncFnOnce(R2, Request<B>) -> U,
                                     U: Response,
                                 {
-                                    if if_(&self.2, &self.0) {
-                                        self.1 = true;
+                                    if let Some(root) = self.2.take() {
+                                        match if_(root, &self.0) {
+                                            Then::Then(_) => self.1 = true,
+                                            Then::Else(root) => self.2 = Some(root),
+                                        }
                                     }
+                                }
+
+                                async fn middleware_mut_map<'a, I, T2, F, U, P>(
+                                    &mut self,
+                                    _if_: I,
+                                    _f: F,
+                                    _post: P,
+                                ) where
+                                    T2: 'a,
+                                    I: FnOnce(R, &Request<B>) -> Then<T2, R>,
+                                    F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
+                                    U: MakeRoute<B> + 'a,
+                                    P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
+                                {
+                                }
+
+                                async fn route_map<I, T2, F, U>(&mut self, _if_: I, _f: F)
+                                where
+                                    I: FnOnce(R, &Request<B>, &StringId) -> Then<T2, R>,
+                                    F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
+                                    U: MakeRoute<B>,
+                                {
+                                }
+
+                                async fn route_map_recursive<I, T2, F, U>(&mut self, _if_: I, _f: F)
+                                where
+                                    I: FnOnce(R, &StringId) -> Then<T2, R>,
+                                    F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
+                                    U: MakeRoute<B>,
+                                {
                                 }
                             }
 
                             let mut check_one = FindOtherMethods(method, false, root);
                             R::register(&mut check_one).await;
                             if check_one.1 {
-                                other_methods.push(check_one.0);
+                                other_method = Some(check_one.0);
+                                break;
                             }
                             root = check_one.2;
                         }
 
-                        match other_methods.is_empty() {
-                            true => {
+                        match other_method {
+                            None => {
                                 tracing::debug!(method=?req.method, route=std::any::type_name::<R>(), "Not matching route for leaf");
                                 RouterResponse::e404()
                             }
-                            false => {
-                                tracing::debug!(allowed=?other_methods, method=?req.method, "Method not allowed");
+                            Some(other_method) => {
+                                tracing::debug!(allowed=?other_method, method=?req.method, "Method not allowed");
                                 RouterResponse::e405()
                             }
                         }
@@ -190,6 +321,40 @@ where
 }
 
 pub trait Router<T, B = Incoming> {
+    fn middleware_mut_map<'a, I, T2, F, U, P>(
+        &mut self,
+        if_: I,
+        f: F,
+        post: P,
+    ) -> impl Future<Output = ()>
+    where
+        T2: 'a,
+        I: FnOnce(T, &Request<B>) -> Then<T2, T>,
+        F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
+        U: MakeRoute<B> + 'a,
+        P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse;
+
+    fn route_map<I, T2, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
+    where
+        I: FnOnce(T, &Request<B>, &StringId) -> Then<T2, T>,
+        F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
+        U: MakeRoute<B>;
+
+    fn route_map_recursive<I, T2, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
+    where
+        I: FnOnce(T, &StringId) -> Then<T2, T>,
+        F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
+        U: MakeRoute<B>;
+
+    fn leaf_map<I, T2, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
+    where
+        I: FnOnce(T, &Method) -> Then<T2, T>,
+        F: AsyncFnOnce(T2, Request<B>) -> U,
+        U: Response;
+}
+
+impl<T, B, R: Router<T, B>> RouterDerived<T, B> for R {}
+pub trait RouterDerived<T, B>: Router<T, B> {
     fn middleware<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, &mut Request<B>) -> U,
@@ -204,8 +369,95 @@ pub trait Router<T, B = Incoming> {
         F: AsyncFnOnce(T, &mut Request<B>) -> U,
         U: MakeRoute<B>,
     {
-        let _ = (if_, f);
-        async move {}
+        async move {
+            self.middleware_mut_map(
+                |self_, req| match if_(&self_, req) {
+                    true => Then::Then(Some(self_)),
+                    false => Then::Else(self_),
+                },
+                async |self_, req| f(self_.take().unwrap(), req).await,
+                async |_self_, res| res,
+            )
+            .await
+        }
+    }
+
+    fn middleware_mut<'a, F, U, P>(&mut self, f: F, post: P) -> impl Future<Output = ()>
+    where
+        T: 'a,
+        F: AsyncFnOnce(&'a mut T, &mut Request<B>) -> U,
+        U: MakeRoute<B> + 'a,
+        P: AsyncFnOnce(T, RouterResponse) -> RouterResponse,
+    {
+        self.middleware_mut_if(|_, _| true, f, post)
+    }
+
+    fn middleware_mut_if<'a, I, F, U, P>(
+        &mut self,
+        if_: I,
+        f: F,
+        post: P,
+    ) -> impl Future<Output = ()>
+    where
+        T: 'a,
+        I: FnOnce(&T, &Request<B>) -> bool,
+        F: AsyncFnOnce(&'a mut T, &mut Request<B>) -> U,
+        U: MakeRoute<B> + 'a,
+        P: AsyncFnOnce(T, RouterResponse) -> RouterResponse,
+    {
+        self.middleware_mut_map(
+            |self_, req| match if_(&self_, req) {
+                true => Then::Then(self_),
+                false => Then::Else(self_),
+            },
+            f,
+            post,
+        )
+    }
+
+    fn route_if<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
+    where
+        I: FnOnce(&T, &Request<B>, &StringId) -> bool,
+        F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
+        U: MakeRoute<B>,
+    {
+        self.route_map(
+            |self_, req, path| match if_(&self_, req, path) {
+                true => Then::Then(self_),
+                false => Then::Else(self_),
+            },
+            f,
+        )
+    }
+
+    fn route_if_recursive<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
+    where
+        I: FnOnce(&T, &StringId) -> bool,
+        F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
+        U: MakeRoute<B>,
+    {
+        self.route_map_recursive(
+            |self_, path| match if_(&self_, path) {
+                true => Then::Then(self_),
+                false => Then::Else(self_),
+            },
+            f,
+        )
+    }
+
+    fn leaf_if<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
+    where
+        I: FnOnce(&T, &Method) -> bool,
+        F: AsyncFnOnce(T, Request<B>) -> U,
+        U: Response,
+    {
+        self.leaf_map(
+            |self_, method| match if_(&self_, method) {
+                true => Then::Then(self_),
+                false => Then::Else(self_),
+            },
+            f,
+        )
     }
 
     fn path<F, U, P>(&mut self, path: P, f: F) -> impl Future<Output = ()>
@@ -248,26 +500,6 @@ pub trait Router<T, B = Incoming> {
         self.route_if_recursive(|_, _| true, f)
     }
 
-    fn route_if<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
-    where
-        I: FnOnce(&T, &Request<B>, &StringId) -> bool,
-        F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
-        U: MakeRoute<B>,
-    {
-        let _ = (if_, f);
-        async move {}
-    }
-
-    fn route_if_recursive<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
-    where
-        I: FnOnce(&T, &StringId) -> bool,
-        F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
-        U: MakeRoute<B>,
-    {
-        let _ = (if_, f);
-        async move {}
-    }
-
     fn leaf<F, U>(&mut self, method: Method, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, Request<B>) -> U,
@@ -282,16 +514,6 @@ pub trait Router<T, B = Incoming> {
         U: Response,
     {
         self.leaf_if(|_, _| true, f)
-    }
-
-    fn leaf_if<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
-    where
-        I: FnOnce(&T, &Method) -> bool,
-        F: AsyncFnOnce(T, Request<B>) -> U,
-        U: Response,
-    {
-        let _ = (if_, f);
-        async move {}
     }
 
     fn get<F, U>(&mut self, f: F) -> impl Future<Output = ()>
@@ -431,86 +653,90 @@ where
         where
             R: Router<Option<T>, B>,
         {
-            async fn middleware_if<I, F, U>(&mut self, if_: I, f: F)
+            async fn middleware_mut_map<'a, I, T2, F, U, P>(&mut self, if_: I, f: F, post: P)
             where
-                I: FnOnce(&T, &Request<B>) -> bool,
-                F: AsyncFnOnce(T, &mut Request<B>) -> U,
-                U: MakeRoute<B>,
+                T2: 'a,
+                I: FnOnce(T, &Request<B>) -> Then<T2, T>,
+                F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
+                U: MakeRoute<B> + 'a,
+                P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
             {
                 self.0
-                    .middleware_if(
+                    .middleware_mut_map(
                         |self_, req| match self_ {
-                            Some(self_) => if_(self_, req),
-                            None => false,
+                            Some(self_) => match if_(self_, req) {
+                                Then::Then(self2) => Then::Then(self2),
+                                Then::Else(self_) => Then::Else(Some(self_)),
+                            },
+                            None => Then::Else(None),
                         },
-                        async |self_, req| match self_ {
-                            Some(self_) => f(self_, req).await,
-                            None => unreachable!(),
-                        },
+                        f,
+                        post,
                     )
                     .await;
             }
 
-            async fn route_if<I, F, U>(&mut self, if_: I, f: F)
+            async fn route_map<I, T2, F, U>(&mut self, if_: I, f: F)
             where
-                I: FnOnce(&T, &Request<B>, &StringId) -> bool,
-                F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
+                I: FnOnce(T, &Request<B>, &StringId) -> Then<T2, T>,
+                F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
                 U: MakeRoute<B>,
             {
                 self.0
-                    .route_if(
+                    .route_map(
                         |self_, req, path| match self_ {
-                            Some(self_) => if_(self_, req, path),
-                            None => false,
+                            Some(self_) => match if_(self_, req, path) {
+                                Then::Then(self2) => Then::Then(self2),
+                                Then::Else(self_) => Then::Else(Some(self_)),
+                            },
+                            None => Then::Else(None),
                         },
-                        async |self_, req, path| match self_ {
-                            Some(self_) => f(self_, req, path).await,
-                            None => unreachable!(),
-                        },
+                        f,
                     )
                     .await;
             }
 
-            async fn route_if_recursive<I, F, U>(&mut self, if_: I, f: F)
+            async fn route_map_recursive<I, T2, F, U>(&mut self, if_: I, f: F)
             where
-                I: FnOnce(&T, &StringId) -> bool,
-                F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
+                I: FnOnce(T, &StringId) -> Then<T2, T>,
+                F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
                 U: MakeRoute<B>,
             {
                 self.0
-                    .route_if_recursive(
+                    .route_map_recursive(
                         |self_, path| match self_ {
-                            Some(self_) => if_(self_, path),
-                            None => false,
+                            Some(self_) => match if_(self_, path) {
+                                Then::Then(self2) => Then::Then(self2),
+                                Then::Else(self_) => Then::Else(Some(self_)),
+                            },
+                            None => Then::Else(None),
                         },
-                        async |self_, req, path| match self_ {
-                            Some(self_) => f(self_, req, path).await,
-                            None => unreachable!(),
-                        },
+                        f,
                     )
                     .await
             }
 
-            async fn leaf_if<I, F, U>(&mut self, if_: I, f: F)
+            async fn leaf_map<I, T2, F, U>(&mut self, if_: I, f: F)
             where
-                I: FnOnce(&T, &Method) -> bool,
-                F: AsyncFnOnce(T, Request<B>) -> U,
+                I: FnOnce(T, &Method) -> Then<T2, T>,
+                F: AsyncFnOnce(T2, Request<B>) -> U,
                 U: Response,
             {
                 self.0
-                    .leaf_if(
+                    .leaf_map(
                         |self_, method| match self_ {
-                            Some(self_) => if_(self_, method),
-                            None => false,
+                            Some(self_) => match if_(self_, method) {
+                                Then::Then(self2) => Then::Then(self2),
+                                Then::Else(self_) => Then::Else(Some(self_)),
+                            },
+                            None => Then::Else(None),
                         },
-                        async |self_, req| match self_ {
-                            Some(self_) => f(self_, req).await,
-                            None => unreachable!(),
-                        },
+                        f,
                     )
                     .await;
             }
         }
+
         async move {
             router
                 .middleware_if(
@@ -525,6 +751,43 @@ where
         }
     }
 }
+
+pub enum Then<U, T> {
+    Then(U),
+    Else(T),
+}
+impl<U, T> Then<U, T> {
+    pub fn map<U2, F>(self, f: F) -> Then<U2, T>
+    where
+        F: FnOnce(U) -> U2,
+    {
+        match self {
+            Then::Then(then) => Then::Then(f(then)),
+            Then::Else(else_) => Then::Else(else_),
+        }
+    }
+
+    pub fn and_then<U2, F>(self, f: F) -> Then<U2, T>
+    where
+        F: FnOnce(U) -> Then<U2, T>,
+    {
+        match self {
+            Then::Then(then) => f(then),
+            Then::Else(else_) => Then::Else(else_),
+        }
+    }
+
+    pub fn map_else<T2, F>(self, f: F) -> Then<U, T2>
+    where
+        F: FnOnce(T) -> T2,
+    {
+        match self {
+            Then::Then(then) => Then::Then(then),
+            Then::Else(else_) => Then::Else(f(else_)),
+        }
+    }
+}
+
 impl<B, T, E> MakeRoute<B> for Result<T, E>
 where
     T: MakeRoute<B>,
@@ -538,82 +801,85 @@ where
             E: Response,
             R: Router<Result<T, E>, B>,
         {
-            async fn middleware_if<I, F, U>(&mut self, if_: I, f: F)
+            async fn middleware_mut_map<'a, I, T2, F, U, P>(&mut self, if_: I, f: F, post: P)
             where
-                I: FnOnce(&T, &Request<B>) -> bool,
-                F: AsyncFnOnce(T, &mut Request<B>) -> U,
-                U: MakeRoute<B>,
+                T2: 'a,
+                I: FnOnce(T, &Request<B>) -> Then<T2, T>,
+                F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
+                U: MakeRoute<B> + 'a,
+                P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
             {
                 self.0
-                    .middleware_if(
+                    .middleware_mut_map(
                         |self_, req| match self_ {
-                            Ok(self_) => if_(self_, req),
-                            Err(_) => false,
+                            Ok(self_) => match if_(self_, req) {
+                                Then::Then(self2) => Then::Then(self2),
+                                Then::Else(self_) => Then::Else(Ok(self_)),
+                            },
+                            self_ @ Err(_) => Then::Else(self_),
                         },
-                        async |self_, req| match self_ {
-                            Ok(self_) => f(self_, req).await,
-                            Err(_) => unreachable!(),
-                        },
+                        f,
+                        post,
                     )
                     .await;
             }
 
-            async fn route_if<I, F, U>(&mut self, if_: I, f: F)
+            async fn route_map<I, T2, F, U>(&mut self, if_: I, f: F)
             where
-                I: FnOnce(&T, &Request<B>, &StringId) -> bool,
-                F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
+                I: FnOnce(T, &Request<B>, &StringId) -> Then<T2, T>,
+                F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
                 U: MakeRoute<B>,
             {
                 self.0
-                    .route_if(
+                    .route_map(
                         |self_, req, path| match self_ {
-                            Ok(self_) => if_(self_, req, path),
-                            Err(_) => false,
+                            Ok(self_) => match if_(self_, req, path) {
+                                Then::Then(self2) => Then::Then(self2),
+                                Then::Else(self_) => Then::Else(Ok(self_)),
+                            },
+                            self_ @ Err(_) => Then::Else(self_),
                         },
-                        async |self_, req, path| match self_ {
-                            Ok(self_) => f(self_, req, path).await,
-                            Err(_) => unreachable!(),
-                        },
+                        f,
                     )
                     .await
             }
 
-            async fn route_if_recursive<I, F, U>(&mut self, if_: I, f: F)
+            async fn route_map_recursive<I, T2, F, U>(&mut self, if_: I, f: F)
             where
-                I: FnOnce(&T, &StringId) -> bool,
-                F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
+                I: FnOnce(T, &StringId) -> Then<T2, T>,
+                F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
                 U: MakeRoute<B>,
             {
                 self.0
-                    .route_if_recursive(
+                    .route_map_recursive(
                         |self_, path| match self_ {
-                            Ok(self_) => if_(self_, path),
-                            Err(_) => false,
+                            Ok(self_) => match if_(self_, path) {
+                                Then::Then(self2) => Then::Then(self2),
+                                Then::Else(self_) => Then::Else(Ok(self_)),
+                            },
+                            self_ @ Err(_) => Then::Else(self_),
                         },
-                        async |self_, req, path| match self_ {
-                            Ok(self_) => f(self_, req, path).await,
-                            Err(_) => unreachable!(),
-                        },
+                        f,
                     )
                     .await
             }
 
-            async fn leaf_if<I, F, U>(&mut self, if_: I, f: F)
+            async fn leaf_map<I, T2, F, U>(&mut self, if_: I, f: F)
             where
-                I: FnOnce(&T, &Method) -> bool,
-                F: AsyncFnOnce(T, Request<B>) -> U,
+                I: FnOnce(T, &Method) -> Then<T2, T>,
+                F: AsyncFnOnce(T2, Request<B>) -> U,
                 U: Response,
             {
                 self.0
-                    .leaf_if(
+                    .leaf_map(
                         |self_, method| match self_ {
-                            Ok(self_) => if_(self_, method),
-                            Err(_) => false,
+                            Ok(self_) => match if_(self_, method) {
+                                Then::Then(self2) => Then::Then(self2),
+                                Then::Else(self_) => Then::Else(Ok(self_)),
+                            },
+                            self_ @ Err(_) => Then::Else(self_),
                         },
-                        async |self_, req| match self_ {
-                            Ok(self_) => f(self_, req).await,
-                            Err(_) => unreachable!(),
-                        },
+                        f,
                     )
                     .await
             }
@@ -641,28 +907,34 @@ where
     fn register<R: Router<Self, B>>(router: &mut R) -> impl Future<Output = ()> {
         struct EitherRouter<'a, R, O, E>(&'a mut R, std::marker::PhantomData<(E, O)>);
 
-        trait OpenEither<E, T1> {
-            fn open_ref(self_: &E) -> Option<&T1>;
-            fn open(self_: E) -> Option<T1>;
+        trait OpenEither<E, T> {
+            fn open(self_: E) -> Then<T, E>;
+            fn close(t: T) -> E;
         }
         struct OpenLeft;
         impl<T1, T2> OpenEither<Either<T1, T2>, T1> for OpenLeft {
-            fn open_ref(self_: &Either<T1, T2>) -> Option<&T1> {
-                self_.as_ref().left()
+            fn open(self_: Either<T1, T2>) -> Then<T1, Either<T1, T2>> {
+                match self_ {
+                    Either::Left(t1) => Then::Then(t1),
+                    e @ Either::Right(_) => Then::Else(e),
+                }
             }
 
-            fn open(self_: Either<T1, T2>) -> Option<T1> {
-                self_.left()
+            fn close(t: T1) -> Either<T1, T2> {
+                Either::Left(t)
             }
         }
         struct OpenRight;
         impl<T1, T2> OpenEither<Either<T1, T2>, T2> for OpenRight {
-            fn open_ref(self_: &Either<T1, T2>) -> Option<&T2> {
-                self_.as_ref().right()
+            fn open(self_: Either<T1, T2>) -> Then<T2, Either<T1, T2>> {
+                match self_ {
+                    e @ Either::Left(_) => Then::Else(e),
+                    Either::Right(t2) => Then::Then(t2),
+                }
             }
 
-            fn open(self_: Either<T1, T2>) -> Option<T2> {
-                self_.right()
+            fn close(t: T2) -> Either<T1, T2> {
+                Either::Right(t)
             }
         }
 
@@ -671,82 +943,70 @@ where
             R: Router<E, B>,
             O: OpenEither<E, T>,
         {
-            async fn middleware_if<I, F, U>(&mut self, if_: I, f: F)
+            async fn middleware_mut_map<'a, I, T2, F, U, P>(&mut self, if_: I, f: F, post: P)
             where
-                I: FnOnce(&T, &Request<B>) -> bool,
-                F: AsyncFnOnce(T, &mut Request<B>) -> U,
-                U: MakeRoute<B>,
+                T2: 'a,
+                I: FnOnce(T, &Request<B>) -> Then<T2, T>,
+                F: AsyncFnOnce(&'a mut T2, &mut Request<B>) -> U,
+                U: MakeRoute<B> + 'a,
+                P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse,
             {
                 self.0
-                    .middleware_if(
-                        |self_, req| match O::open_ref(self_) {
-                            Some(self_) => if_(self_, req),
-                            None => false,
+                    .middleware_mut_map(
+                        |self_, req| {
+                            O::open(self_).and_then(|self_| if_(self_, req).map_else(O::close))
                         },
-                        async |self_, req| match O::open(self_) {
-                            Some(self_) => f(self_, req).await,
-                            None => unreachable!(),
-                        },
+                        f,
+                        post,
                     )
                     .await
             }
 
-            async fn route_if<I, F, U>(&mut self, if_: I, f: F)
+            async fn route_map<I, T2, F, U>(&mut self, if_: I, f: F)
             where
-                I: FnOnce(&T, &Request<B>, &StringId) -> bool,
-                F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
+                I: FnOnce(T, &Request<B>, &StringId) -> Then<T2, T>,
+                F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
                 U: MakeRoute<B>,
             {
                 self.0
-                    .route_if(
-                        |self_, req, path| match O::open_ref(self_) {
-                            Some(self_) => if_(self_, req, path),
-                            None => false,
+                    .route_map(
+                        |self_, req, path| {
+                            O::open(self_)
+                                .and_then(|self_| if_(self_, req, path).map_else(O::close))
                         },
-                        async |self_, req, path| match O::open(self_) {
-                            Some(self_) => f(self_, req, path).await,
-                            None => unreachable!(),
-                        },
+                        f,
                     )
                     .await
             }
 
-            async fn route_if_recursive<I, F, U>(&mut self, if_: I, f: F)
+            async fn route_map_recursive<I, T2, F, U>(&mut self, if_: I, f: F)
             where
-                I: FnOnce(&T, &StringId) -> bool,
-                F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
+                I: FnOnce(T, &StringId) -> Then<T2, T>,
+                F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
                 U: MakeRoute<B>,
             {
                 self.0
-                    .route_if_recursive(
-                        |self_, path| match O::open_ref(self_) {
-                            Some(self_) => if_(self_, path),
-                            None => false,
+                    .route_map_recursive(
+                        |self_, path| {
+                            O::open(self_).and_then(|self_| if_(self_, path).map_else(O::close))
                         },
-                        async |self_, req, path| match O::open(self_) {
-                            Some(self_) => f(self_, req, path).await,
-                            None => unreachable!(),
-                        },
+                        f,
                     )
                     .await
             }
 
-            async fn leaf_if<I, F, U>(&mut self, if_: I, f: F)
+            async fn leaf_map<I, T2, F, U>(&mut self, if_: I, f: F)
             where
-                I: FnOnce(&T, &Method) -> bool,
-                F: AsyncFnOnce(T, Request<B>) -> U,
+                I: FnOnce(T, &Method) -> Then<T2, T>,
+                F: AsyncFnOnce(T2, Request<B>) -> U,
                 U: Response,
             {
                 self.0
-                    .leaf_if(
-                        |self_, method| match O::open_ref(self_) {
-                            Some(self_) => if_(self_, method),
-                            None => false,
+                    .leaf_map(
+                        |self_, method| {
+                            O::open(self_).and_then(|self_| if_(self_, method).map_else(O::close))
                         },
-                        async |self_, req| match O::open(self_) {
-                            Some(self_) => f(self_, req).await,
-                            None => unreachable!(),
-                        },
+                        f,
                     )
                     .await
             }
@@ -807,6 +1067,10 @@ impl RouterResponse {
 
     pub fn e405() -> Self {
         Self::new(EmptyResponse(StatusCode::METHOD_NOT_ALLOWED))
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.boxed.status_code().is_success()
     }
 
     #[track_caller]
@@ -897,31 +1161,20 @@ impl<T, U> From<T> for RouterState<T, U> {
     }
 }
 impl<T, U> RouterState<T, U> {
-    async fn execute<F>(&mut self, f: F)
+    async fn execute_map<IF, T2, F>(&mut self, if_: IF, f: F)
     where
-        F: AsyncFnOnce(T) -> U,
+        IF: FnOnce(T) -> Then<T2, T>,
+        F: AsyncFnOnce(T2) -> U,
     {
-        match std::mem::replace(self, RouterState::Empty) {
-            RouterState::Init(init) => {
-                *self = RouterState::Response(f(init).await);
-            }
-            other => *self = other,
-        }
-    }
-
-    async fn execute_if<IF, F>(&mut self, if_: IF, f: F)
-    where
-        IF: FnOnce(&mut T) -> bool,
-        F: AsyncFnOnce(T) -> U,
-    {
-        let execute = match self {
-            RouterState::Init(init) => if_(init),
-            _ => false,
+        let new = match std::mem::replace(self, Self::Empty) {
+            RouterState::Init(init) => match if_(init) {
+                Then::Then(init2) => Self::Response(f(init2).await),
+                Then::Else(init) => Self::Init(init),
+            },
+            other => other,
         };
 
-        if execute {
-            self.execute(f).await
-        }
+        *self = new;
     }
 
     fn take(self) -> Either<T, U> {

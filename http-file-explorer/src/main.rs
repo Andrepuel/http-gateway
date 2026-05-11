@@ -3,7 +3,7 @@ use http_gateway::{
     bytes::{Bytes, BytesMut},
     handler::{HttpResponse, Json, Json201, ResourceLocation, Response, ResponseBody},
     hyper::{Method, StatusCode},
-    router::{MakeRoute, RouterHandler},
+    router::{MakeRoute, RouterDerived, RouterHandler},
 };
 use std::{
     borrow::Cow,

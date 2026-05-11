@@ -1,6 +1,6 @@
 use http_gateway::{
     handler::{Authorization, Json, StringId},
-    router::{self, MakeRoute, RouterHandler},
+    router::{self, MakeRoute, RouterDerived, RouterHandler},
 };
 use std::{collections::HashMap, io};
 

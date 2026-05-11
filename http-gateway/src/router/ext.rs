@@ -2,12 +2,12 @@
 
 use crate::{
     handler::{Json, Request, Response, StringId},
-    router::{EmptyResponse, MakeRoute, Router},
+    router::{EmptyResponse, MakeRoute, Router, RouterDerived, RouterResponse, Then},
 };
 use hyper::{Method, StatusCode, body::Incoming};
 
-impl<T, S> RouterExt<T> for S where S: Router<T, Incoming> {}
-pub trait RouterExt<T>: Router<T, Incoming> {
+impl<T, S> RouterExt<T> for S where S: Router<T, Incoming> + RouterDerived<T, Incoming> {}
+pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
     async fn deserialize_if<B, I, F, U>(&mut self, if_: I, f: F)
     where
         B: serde::de::DeserializeOwned,
@@ -158,6 +158,69 @@ pub trait RouterExt<T>: Router<T, Incoming> {
         .await;
 
         self.setter(name, set).await;
+    }
+
+    async fn transaction<'a, B, F, U, C, R, D, E>(
+        &mut self,
+        begin: B,
+        route: F,
+        commit: C,
+        rollback: R,
+    ) where
+        B: AsyncFnOnce(T) -> Result<D, E>,
+        F: AsyncFnOnce(&'a mut D) -> U + 'a,
+        U: MakeRoute<Incoming> + 'a,
+        C: AsyncFnOnce(D) -> Result<(), E> + 'a,
+        R: AsyncFnOnce(D) + 'a,
+        E: Response,
+        D: 'a,
+    {
+        self.middleware(async move |self_, _| {
+            begin(self_).await.map(|trans| Transaction {
+                route: Some(route),
+                trans,
+                commit,
+                rollback,
+                marker: Default::default(),
+            })
+        })
+        .await;
+
+        struct Transaction<'a, F, D, C, R> {
+            route: Option<F>,
+            trans: D,
+            commit: C,
+            rollback: R,
+            marker: std::marker::PhantomData<fn(&'a ())>,
+        }
+        impl<'a, F, U, D, C, R, E> MakeRoute<Incoming> for Transaction<'a, F, D, C, R>
+        where
+            F: AsyncFnOnce(&'a mut D) -> U + 'a,
+            U: MakeRoute<Incoming> + 'a,
+            C: AsyncFnOnce(D) -> Result<(), E> + 'a,
+            R: AsyncFnOnce(D) + 'a,
+            E: Response,
+            D: 'a,
+        {
+            async fn register<Ro: Router<Self, Incoming>>(router: &mut Ro) {
+                router
+                    .middleware_mut_map(
+                        |self_, _| Then::Then(self_),
+                        async |self_, _| (self_.route.take().unwrap())(&mut self_.trans).await,
+                        async |self_, res| match res.is_success() {
+                            true => match (self_.commit)(self_.trans).await {
+                                Ok(()) => res,
+                                Err(error) => RouterResponse::new(error),
+                            },
+                            false => {
+                                (self_.rollback)(self_.trans).await;
+                                res
+                            }
+                        },
+                    )
+                    .await
+            }
+        }
     }
 }
 
