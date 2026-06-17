@@ -2,6 +2,12 @@
 name = "http-gateway"
 version = "0.1.0"
 edition = "2024"
+description = "A small, tree-structured router for building REST APIs."
+license = "MIT"
+readme = "../README.md"
+repository = "https://github.com/Andrepuel/http-gateway"
+keywords = ["http", "router", "rest", "api", "async"]
+categories = ["web-programming::http-server", "asynchronous"]
 
 [dependencies]
 ascii = "1.1.0"
