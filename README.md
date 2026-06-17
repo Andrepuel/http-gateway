@@ -1,5 +1,8 @@
 # http-gateway
 
+[![crates.io](https://img.shields.io/crates/v/http-gateway.svg)](https://crates.io/crates/http-gateway)
+[![docs.rs](https://img.shields.io/docsrs/http-gateway)](https://docs.rs/http-gateway)
+
 A small, tree-structured HTTP router for building REST APIs in Rust.
 
 An API is described as a tree of `MakeRoute` nodes; the router walks the URL path
