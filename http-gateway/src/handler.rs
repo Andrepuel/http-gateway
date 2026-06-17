@@ -83,9 +83,18 @@ impl From<String> for Authorization {
     }
 }
 
+/// Turns an HTTP [`Request`] into a [`Response`].
+///
+/// This is the generic entry point the server invokes for every incoming
+/// request, parameterized over the body type `B`. Implementations are usually
+/// composed rather than written by hand: the primary one is
+/// [`RouterHandler`](crate::router::RouterHandler), which dispatches the request
+/// through a routing tree of [`MakeRoute`](crate::router::MakeRoute) nodes.
 pub trait Handler<B> {
+    /// The response type this handler produces.
     type Response: Response;
 
+    /// Handle a single request, resolving to the response.
     fn handle(&self, req: Request<B>) -> impl Future<Output = Self::Response>;
 }
 impl<B, H: Handler<B>> Handler<B> for Rc<H> {
@@ -96,15 +105,31 @@ impl<B, H: Handler<B>> Handler<B> for Rc<H> {
     }
 }
 
+/// A value that can be turned into an HTTP response.
+///
+/// A leaf handler returns some `Response`; the server reads its status, headers,
+/// and streamed [`Body`](Response::Body) to build the wire response. Implement
+/// it for your own response types, or use the provided ones — [`Json`],
+/// [`Json201`], [`HttpResponse`], [`Empty404`] — and the blanket impls for
+/// `Result`, `Option`, `Either`, and [`io::Error`].
+///
+/// The `'static` bound lets [`RouterResponse`](crate::router::RouterResponse)
+/// erase the concrete type behind a box.
 pub trait Response: 'static {
+    /// The streamed response body. See [`ResponseBody`].
     type Body: ResponseBody;
 
+    /// The HTTP status code to send.
     fn status_code(&self) -> StatusCode;
+    /// Consume the response into its body stream.
     fn into_body(self) -> Self::Body;
+    /// Headers to send in addition to the content type derived from the body.
+    /// Defaults to none.
     fn extra_headers(&self) -> HashMap<StringId, String> {
         Default::default()
     }
 }
+/// Replies `500 Internal Server Error` with an empty body, logging the error.
 impl Response for io::Error {
     type Body = NoBody;
 
@@ -118,6 +143,9 @@ impl Response for io::Error {
         StatusCode::INTERNAL_SERVER_ERROR
     }
 }
+/// Responds with the `Ok` value on success or the `Err` value on failure; both
+/// sides are themselves responses, so the status comes from whichever variant
+/// is present.
 impl<T, E> Response for Result<T, E>
 where
     T: Response,
@@ -147,6 +175,8 @@ where
         }
     }
 }
+/// Responds with whichever variant is present, letting a handler return one of
+/// two different response types from the same branch.
 impl<T1, T2> Response for Either<T1, T2>
 where
     T1: Response,
@@ -176,6 +206,8 @@ where
         }
     }
 }
+/// `Some` responds with the inner value; `None` replies `404 Not Found` with an
+/// empty body.
 impl<T> Response for Option<T>
 where
     T: Response,
@@ -203,6 +235,8 @@ where
             .unwrap_or_default()
     }
 }
+/// Never produced; lets a handler whose error half cannot occur still satisfy a
+/// `Response` bound. Calling its methods panics.
 impl Response for Infallible {
     type Body = NoBody;
 
@@ -215,8 +249,19 @@ impl Response for Infallible {
     }
 }
 
+/// The body of a [`Response`]: an [`AsyncRead`] stream of bytes plus the
+/// metadata needed to frame it.
+///
+/// The server reads from the stream until it ends, sending the bytes as the
+/// response body. [`content_type`](ResponseBody::content_type) supplies the
+/// `Content-Type` header (an empty string omits it) and
+/// [`length`](ResponseBody::length) the `Content-Length` when known.
 pub trait ResponseBody: AsyncRead {
+    /// The MIME type for the `Content-Type` header; an empty string omits the
+    /// header.
     fn content_type(&self) -> Cow<'static, str>;
+    /// The body length in bytes if known ahead of time, else `None` for a
+    /// streamed body of unknown size.
     fn length(&self) -> Option<u64>;
 }
 impl ResponseBody for Pin<Box<dyn ResponseBody>> {
@@ -229,6 +274,7 @@ impl ResponseBody for Pin<Box<dyn ResponseBody>> {
     }
 }
 
+/// An empty [`ResponseBody`] — zero bytes and no content type.
 pub struct NoBody;
 impl AsyncRead for NoBody {
     fn poll_read(
@@ -249,6 +295,8 @@ impl ResponseBody for NoBody {
     }
 }
 
+/// A [`ResponseBody`] that is one of two body types, chosen at runtime — the
+/// body counterpart to a `Response` for [`Either`], [`Result`], or [`Option`].
 pub struct EitherBody<T1, T2>(Either<T1, T2>);
 impl<T1, T2> From<Either<T1, T2>> for EitherBody<T1, T2> {
     fn from(value: Either<T1, T2>) -> Self {
@@ -302,8 +350,11 @@ where
     }
 }
 
+/// A [`Response`] from an explicit [`ResponseBody`] and [`StatusCode`] — the
+/// general-purpose way to return a raw or streamed body.
 pub struct HttpResponse<B>(pub B, pub StatusCode);
 impl<B: ResponseBody + 'static> HttpResponse<B> {
+    /// Construct an `HttpResponse` with status `200 OK`.
     pub fn h200(b: B) -> Self {
         Self(b, StatusCode::OK)
     }
@@ -320,9 +371,12 @@ impl<B: ResponseBody + 'static> Response for HttpResponse<B> {
     }
 }
 
+/// A [`Response`] that serializes `T` to JSON with the given [`StatusCode`] and
+/// `application/json` content type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Json<T>(pub T, pub StatusCode);
 impl<T: serde::Serialize + 'static> Json<T> {
+    /// Construct a `Json` response with status `200 OK`.
     pub fn j200(t: T) -> Self {
         Self(t, StatusCode::OK)
     }
@@ -345,6 +399,8 @@ impl<T: serde::Serialize + 'static> Response for Json<T> {
     }
 }
 
+/// A `201 Created` [`Response`]: serializes `T` to JSON and sets a `Location`
+/// header from the new resource's [`ResourceLocation`].
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Json201<T>(pub T);
 impl<T: serde::Serialize + ResourceLocation + 'static> Response for Json201<T> {
@@ -366,17 +422,24 @@ impl<T: serde::Serialize + ResourceLocation + 'static> Response for Json201<T> {
     }
 }
 
+/// Supplies the URL of a created resource for the `Location` header of a
+/// [`Json201`] response.
 pub trait ResourceLocation {
+    /// The full location, by default [`base`](ResourceLocation::base) followed
+    /// by [`resource_id`](ResourceLocation::resource_id).
     fn location(&self) -> String {
         let mut out = Self::base().to_string();
         out.push_str(&self.resource_id());
         out
     }
 
+    /// The base path under which resources of this type live (e.g. `/users/`).
     fn base() -> &'static str;
+    /// This resource's identifier, appended to the base.
     fn resource_id(&self) -> Cow<'_, str>;
 }
 
+/// A [`Response`] that replies `404 Not Found` with an empty body.
 pub struct Empty404;
 impl Response for Empty404 {
     type Body = NoBody;
@@ -390,6 +453,8 @@ impl Response for Empty404 {
     }
 }
 
+/// A [`ResponseBody`] backed by fully-buffered bytes with a fixed content type
+/// and known length. Backs [`Json`]/[`Json201`].
 pub struct FullBody(bytes::Bytes, Cow<'static, str>);
 impl AsyncRead for FullBody {
     fn poll_read(
@@ -412,18 +477,52 @@ impl ResponseBody for FullBody {
     }
 }
 
+/// A string that compares **case-insensitively** while preserving its original
+/// casing.
+///
+/// Routing keys — path segments, header and query names — must match
+/// regardless of case (`"Content-Type"` and `"content-type"` are the same key),
+/// yet the original spelling is still worth keeping for display, logging, and
+/// serialization. `StringId` carries both: the original text (via [`Deref`] to
+/// [`str`], [`Display`](std::fmt::Display), and [`Serialize`](serde::Serialize))
+/// and a lowercased identity (via [`id`](StringId::id)) used by [`PartialEq`],
+/// [`Eq`], [`Hash`], and [`Ord`]. As a result it can key a [`HashMap`] while
+/// staying case-insensitive.
+///
+/// It can be built from either an owned [`String`] or a `&'static str`, the
+/// latter without allocating when the text is already lowercase. The four
+/// variants encode those two axes — owned vs. static, and whether a separate
+/// lowercased copy was needed:
+///
+/// ```
+/// # use http_gateway::handler::StringId;
+/// let from_static: StringId = "Authorization".into();
+/// let from_owned: StringId = String::from("Authorization").into();
+/// assert_eq!(from_static, from_owned);
+/// assert_eq!(from_static, "authorization"); // case-insensitive comparison
+/// ```
 #[derive(Clone)]
 pub enum StringId {
+    /// An owned string that was already lowercase; the text is its own id.
     Same(String),
+    /// An owned mixed-case string paired with its lowercased id.
     OriginalAndId(String, String),
+    /// A `&'static str` that was already lowercase; the text is its own id.
     Static(&'static str),
+    /// A `&'static str` with mixed case paired with its lowercased id.
     StaticAndId(&'static str, String),
 }
 impl StringId {
+    /// Build a `StringId` from a borrowed string, copying it into an owned
+    /// value. Prefer `StringId::from(&'static str)` when the text is a string
+    /// literal to avoid the allocation.
     pub fn new(id: &str) -> Self {
         Self::from(id.to_string())
     }
 
+    /// The lowercased identity used for comparison, hashing, and ordering. Use
+    /// [`Deref`]/[`Display`](std::fmt::Display) instead when you want the
+    /// original casing.
     pub fn id(&self) -> &str {
         match self {
             StringId::Same(id) => id,
@@ -433,6 +532,8 @@ impl StringId {
         }
     }
 }
+/// Takes ownership of `value`. If it is already lowercase no extra allocation
+/// is made; otherwise a lowercased id is computed alongside it.
 impl From<String> for StringId {
     fn from(value: String) -> Self {
         if value.chars().all(char::is_lowercase) {
@@ -443,6 +544,8 @@ impl From<String> for StringId {
         Self::OriginalAndId(value, id)
     }
 }
+/// Borrows a string literal without allocating when it is already lowercase;
+/// only a mixed-case literal needs an owned lowercased id.
 impl From<&'static str> for StringId {
     fn from(value: &'static str) -> Self {
         if value.chars().all(char::is_lowercase) {

@@ -7,6 +7,12 @@ use futures::FutureExt;
 use hyper::{Method, StatusCode, body::Incoming};
 use std::{any::TypeId, collections::HashMap, pin::Pin};
 
+/// The [`Handler`] that drives a routing tree.
+///
+/// Wraps a root [`MakeRoute`] node `R` and, for each request, walks the tree
+/// from that root to produce a [`RouterResponse`]. This is the primary
+/// [`Handler`] implementation; construct one with [`new`](RouterHandler::new)
+/// and hand it to the server.
 pub struct RouterHandler<B, R> {
     root: R,
     body_type: std::marker::PhantomData<fn(B)>,
@@ -15,6 +21,10 @@ impl<B, R> RouterHandler<B, R>
 where
     R: MakeRoute<B> + Clone,
 {
+    /// Build a handler that routes every request starting from `root`.
+    ///
+    /// `root` is cloned per request, so it holds the shared state from which a
+    /// request's routing begins.
     pub fn new(root: R) -> Self {
         Self {
             root,
@@ -321,7 +331,37 @@ where
     }
 }
 
+/// The declaration surface handed to [`MakeRoute::register`].
+///
+/// `T` is the node's own type (the `Self` of the [`MakeRoute`] being
+/// registered) and `B` is the request body type. A `Router` collects the
+/// node's middleware, routes, and leaves; the framework then evaluates them in
+/// phase order (see [`MakeRoute`]) to resolve a request.
+///
+/// This trait holds only the four **primitive** declarations. Each takes a
+/// matcher `if_` that receives the node by value and returns a [`Then`] —
+/// `Then(t2)` to claim the request (optionally transforming the node into some
+/// `T2`) or `Else(t)` to decline and pass the node on to the next declaration.
+/// You normally do not call these directly; reach for the higher-level helpers
+/// in [`RouterDerived`] ([`path`](RouterDerived::path),
+/// [`get`](RouterDerived::get), [`middleware`](RouterDerived::middleware), …),
+/// which are defined in terms of these four.
 pub trait Router<T, B = Incoming> {
+    /// Declare middleware: code that runs at this node *before* a path segment
+    /// is consumed (phase 1).
+    ///
+    /// This is the most general middleware primitive. When `if_` returns
+    /// `Then(t2)` the middleware claims the request:
+    ///
+    /// - `f` is invoked with a mutable borrow of the transformed state `t2`
+    ///   and the [`Request`] (which it may rewrite), and returns the child
+    ///   [`MakeRoute`] the router descends into to produce a response.
+    /// - `post` is then invoked with the owned state and that
+    ///   [`RouterResponse`], giving the middleware a chance to inspect or
+    ///   replace the response on the way back out.
+    ///
+    /// The first matching middleware wins; later declarations at this node are
+    /// skipped.
     fn middleware_mut_map<'a, I, T2, F, U, P>(
         &mut self,
         if_: I,
@@ -335,18 +375,42 @@ pub trait Router<T, B = Incoming> {
         U: MakeRoute<B> + 'a,
         P: AsyncFnOnce(T2, RouterResponse) -> RouterResponse;
 
+    /// Declare a route: a child reached by consuming the next path segment
+    /// (phase 2).
+    ///
+    /// `if_` sees the node, the [`Request`], and the upcoming segment
+    /// ([`StringId`]) and decides whether to match. On `Then(t2)`, `f` receives
+    /// the transformed state, the request, and the now-consumed segment, and
+    /// returns the child [`MakeRoute`] to descend into. The first matching
+    /// route wins; if none match, the router replies `404`.
     fn route_map<I, T2, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
     where
         I: FnOnce(T, &Request<B>, &StringId) -> Then<T2, T>,
         F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
         U: MakeRoute<B>;
 
+    /// Like [`route_map`](Router::route_map), but for a node that routes into
+    /// *its own type*.
+    ///
+    /// The child future is boxed, erasing the recursion so the node type stays
+    /// finite (an unboxed self-recursive route would be an infinitely-sized
+    /// type). Because of that erasure the matcher `if_` is given only the node
+    /// and the segment — not the [`Request`]; the request is still available to
+    /// `f`. Use this for tree-shaped resources such as nested directories.
     fn route_map_recursive<I, T2, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
     where
         I: FnOnce(T, &StringId) -> Then<T2, T>,
         F: AsyncFnOnce(T2, &mut Request<B>, StringId) -> U,
         U: MakeRoute<B>;
 
+    /// Declare a leaf: a terminal handler reached when the path is exhausted
+    /// (phase 3).
+    ///
+    /// `if_` selects on the request [`Method`]; on `Then(t2)`, `f` consumes the
+    /// state and the owned [`Request`] and returns the final [`Response`]. The
+    /// first matching leaf wins. If the path is exhausted but no leaf matches
+    /// the method, the router replies `405` when another method would have
+    /// matched, otherwise `404`.
     fn leaf_map<I, T2, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
     where
         I: FnOnce(T, &Method) -> Then<T2, T>,
@@ -355,7 +419,27 @@ pub trait Router<T, B = Incoming> {
 }
 
 impl<T, B, R: Router<T, B>> RouterDerived<T, B> for R {}
+/// Ergonomic helpers built on the four [`Router`] primitives.
+///
+/// This trait is blanket-implemented for every [`Router`], so its methods are
+/// available on the `router` passed to [`MakeRoute::register`]. The helpers
+/// fall into the three phases described on [`MakeRoute`]:
+///
+/// - **Middleware** — [`middleware`](Self::middleware),
+///   [`middleware_if`](Self::middleware_if), [`middleware_map`](Self::middleware_map),
+///   [`middleware_mut`](Self::middleware_mut), [`middleware_mut_if`](Self::middleware_mut_if).
+/// - **Routes** (consume a segment, descend into a child) —
+///   [`path`](Self::path), [`route`](Self::route), [`route_if`](Self::route_if),
+///   and their [`path_recursive`](Self::path_recursive) /
+///   [`route_recursive`](Self::route_recursive) counterparts.
+/// - **Leaves** (terminal, by method) — [`get`](Self::get), [`put`](Self::put),
+///   [`post`](Self::post), [`delete`](Self::delete), [`leaf`](Self::leaf),
+///   [`any_leaf`](Self::any_leaf); the `*_path` and `*_route` families combine a
+///   segment match with a terminal handler in one call.
 pub trait RouterDerived<T, B>: Router<T, B> {
+    /// Attach middleware that always runs at this node, transforming it into
+    /// the [`MakeRoute`] returned by `f`. See [`middleware_mut_map`](Router::middleware_mut_map)
+    /// for the underlying primitive.
     fn middleware<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, &mut Request<B>) -> U,
@@ -364,6 +448,8 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.middleware_if(|_, _| true, f)
     }
 
+    /// Attach middleware that runs only when `if_` returns `true` for the node
+    /// and [`Request`].
     fn middleware_if<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
     where
         I: FnOnce(&T, &Request<B>) -> bool,
@@ -383,6 +469,8 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         }
     }
 
+    /// Attach middleware whose match test may transform the node into a
+    /// different type `T2` via [`Then`], without a post-processing step.
     fn middleware_map<I, T2, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
     where
         I: FnOnce(T, &mut Request<B>) -> Then<T2, T>,
@@ -400,6 +488,9 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         }
     }
 
+    /// Attach always-running middleware that borrows the node mutably for the
+    /// duration of the request and runs `post` on the [`RouterResponse`] on the
+    /// way back out — e.g. to set a header or log the outcome.
     fn middleware_mut<'a, F, U, P>(&mut self, f: F, post: P) -> impl Future<Output = ()>
     where
         T: 'a,
@@ -410,6 +501,8 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.middleware_mut_if(|_, _| true, f, post)
     }
 
+    /// Like [`middleware_mut`](Self::middleware_mut), but runs only when `if_`
+    /// returns `true` for the node and [`Request`].
     fn middleware_mut_if<'a, I, F, U, P>(
         &mut self,
         if_: I,
@@ -433,6 +526,9 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         )
     }
 
+    /// Declare a route taken when `if_` returns `true` for the node, the
+    /// [`Request`], and the next path segment. `f` receives the consumed
+    /// segment and returns the child [`MakeRoute`].
     fn route_if<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
     where
         I: FnOnce(&T, &Request<B>, &StringId) -> bool,
@@ -448,6 +544,9 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         )
     }
 
+    /// [`route_if`](Self::route_if) for a node that routes into its own type;
+    /// see [`route_map_recursive`](Router::route_map_recursive). The condition
+    /// sees only the node and the segment, not the [`Request`].
     fn route_if_recursive<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
     where
         I: FnOnce(&T, &StringId) -> bool,
@@ -463,6 +562,8 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         )
     }
 
+    /// Declare a leaf taken when `if_` returns `true` for the node and the
+    /// request [`Method`]. Reached only when the path is exhausted.
     fn leaf_if<I, F, U>(&mut self, if_: I, f: F) -> impl Future<Output = ()>
     where
         I: FnOnce(&T, &Method) -> bool,
@@ -478,6 +579,8 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         )
     }
 
+    /// Route into a child when the next path segment equals `path`. The common
+    /// way to mount a fixed sub-resource (e.g. `"users"`).
     fn path<F, U, P>(&mut self, path: P, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, &mut Request<B>) -> U,
@@ -490,6 +593,8 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         )
     }
 
+    /// [`path`](Self::path) for a node that routes into its own type; see
+    /// [`route_map_recursive`](Router::route_map_recursive).
     fn path_recursive<F, U, P>(&mut self, path: P, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, &mut Request<B>) -> U,
@@ -502,6 +607,8 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         )
     }
 
+    /// Route into a child for *any* next path segment, passing the consumed
+    /// segment to `f`. Use this to capture a path parameter (e.g. an id).
     fn route<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
@@ -510,6 +617,8 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.route_if(|_, _, _| true, f)
     }
 
+    /// [`route`](Self::route) for a node that routes into its own type; see
+    /// [`route_map_recursive`](Router::route_map_recursive).
     fn route_recursive<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
@@ -518,6 +627,8 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.route_if_recursive(|_, _| true, f)
     }
 
+    /// Declare a terminal leaf matched on `method`, reached when the path is
+    /// exhausted.
     fn leaf<F, U>(&mut self, method: Method, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, Request<B>) -> U,
@@ -526,6 +637,7 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf_if(move |_, req_method| req_method == method, f)
     }
 
+    /// Declare a terminal leaf matched for any method.
     fn any_leaf<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, Request<B>) -> U,
@@ -534,6 +646,7 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf_if(|_, _| true, f)
     }
 
+    /// [`leaf`](Self::leaf) fixed to [`Method::GET`].
     fn get<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, Request<B>) -> U,
@@ -542,6 +655,7 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf(Method::GET, f)
     }
 
+    /// [`leaf`](Self::leaf) fixed to [`Method::PUT`].
     fn put<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, Request<B>) -> U,
@@ -550,6 +664,7 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf(Method::PUT, f)
     }
 
+    /// [`leaf`](Self::leaf) fixed to [`Method::POST`].
     fn post<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, Request<B>) -> U,
@@ -558,6 +673,7 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf(Method::POST, f)
     }
 
+    /// [`leaf`](Self::leaf) fixed to [`Method::DELETE`].
     fn delete<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, Request<B>) -> U,
@@ -566,17 +682,29 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf(Method::DELETE, f)
     }
 
+    /// Terminal handler for a request with *exactly one* segment remaining and
+    /// the given `method`.
+    ///
+    /// Unlike [`leaf`](Self::leaf) (which fires only once the path is fully
+    /// consumed), this matches a single trailing segment and hands it to `f`,
+    /// treating the result as terminal. Use it for endpoints addressed by a
+    /// trailing id, e.g. `GET /users/{id}`.
+    ///
+    /// The match requires the segment to be the last one. If further segments
+    /// remain the route declines, so sibling declarations at this node still
+    /// get a chance to match rather than the request short-circuiting to `404`.
     fn leaf_route<F, U>(&mut self, method: Method, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
         U: Response,
     {
         self.route_if(
-            move |_, req, _| req.method == method,
+            move |_, req, _| req.method == method && req.path.is_empty(),
             async |self_, req, path| LeafRoute(f(self_, req, path).await),
         )
     }
 
+    /// [`leaf_route`](Self::leaf_route) fixed to [`Method::GET`].
     fn get_route<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
@@ -585,6 +713,7 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf_route(Method::GET, f)
     }
 
+    /// [`leaf_route`](Self::leaf_route) fixed to [`Method::PUT`].
     fn put_route<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
@@ -593,6 +722,7 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf_route(Method::PUT, f)
     }
 
+    /// [`leaf_route`](Self::leaf_route) fixed to [`Method::POST`].
     fn post_route<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
@@ -601,6 +731,7 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf_route(Method::POST, f)
     }
 
+    /// [`leaf_route`](Self::leaf_route) fixed to [`Method::DELETE`].
     fn delete_route<F, U>(&mut self, f: F) -> impl Future<Output = ()>
     where
         F: AsyncFnOnce(T, &mut Request<B>, StringId) -> U,
@@ -609,6 +740,11 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf_route(Method::DELETE, f)
     }
 
+    /// Terminal handler for a request whose final segment equals `path` and
+    /// whose method is `method`.
+    ///
+    /// Combines a fixed-segment match with a terminal leaf in one call, e.g.
+    /// `POST /users/login`.
     fn leaf_path<P, F, U>(&mut self, path: P, method: Method, f: F) -> impl Future<Output = ()>
     where
         P: Into<StringId>,
@@ -616,11 +752,14 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         U: Response,
     {
         self.route_if(
-            move |_, req, req_path| req.method == method && req_path == &path.into(),
+            move |_, req, req_path| {
+                req.method == method && req_path == &path.into() && req.path.is_empty()
+            },
             async |self_, req, _| LeafRoute(f(self_, req).await),
         )
     }
 
+    /// [`leaf_path`](Self::leaf_path) fixed to [`Method::GET`].
     fn get_path<P, F, U>(&mut self, path: P, f: F) -> impl Future<Output = ()>
     where
         P: Into<StringId>,
@@ -630,6 +769,7 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf_path(path, Method::GET, f)
     }
 
+    /// [`leaf_path`](Self::leaf_path) fixed to [`Method::PUT`].
     fn put_path<P, F, U>(&mut self, path: P, f: F) -> impl Future<Output = ()>
     where
         P: Into<StringId>,
@@ -639,6 +779,7 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf_path(path, Method::PUT, f)
     }
 
+    /// [`leaf_path`](Self::leaf_path) fixed to [`Method::POST`].
     fn post_path<P, F, U>(&mut self, path: P, f: F) -> impl Future<Output = ()>
     where
         P: Into<StringId>,
@@ -648,6 +789,7 @@ pub trait RouterDerived<T, B>: Router<T, B> {
         self.leaf_path(path, Method::POST, f)
     }
 
+    /// [`leaf_path`](Self::leaf_path) fixed to [`Method::DELETE`].
     fn delete_path<P, F, U>(&mut self, path: P, f: F) -> impl Future<Output = ()>
     where
         P: Into<StringId>,
@@ -658,9 +800,71 @@ pub trait RouterDerived<T, B>: Router<T, B> {
     }
 }
 
+/// A node in the routing tree.
+///
+/// This is the trait you implement to describe how a request is routed. Each
+/// implementor represents a single **node**: a point in the URL path at which
+/// the router decides what to do next. From a node you may attach middleware,
+/// descend into child nodes by consuming a path segment, or terminate the
+/// request by producing a [`Response`].
+///
+/// # The routing model
+///
+/// A request carries its path as a queue of segments ([`Request::path`]). The
+/// router walks the tree one segment at a time. At every node it calls
+/// [`register`](MakeRoute::register), giving you a [`Router`] on which you
+/// declare what that node offers. Declarations are evaluated in **three
+/// phases**, and within a phase **in declaration order, first match wins**:
+///
+/// 1. **Middleware** — runs before any segment is consumed. The first
+///    middleware whose condition matches takes over the request: it may
+///    inspect or rewrite the [`Request`], swap the node for a different
+///    [`MakeRoute`], and post-process the eventual [`RouterResponse`]. See
+///    [`middleware`](RouterDerived::middleware) and friends.
+/// 2. **Routes** — consulted only when the path still has at least one
+///    segment. The matching route consumes that segment and yields a child
+///    [`MakeRoute`] that the router descends into. See
+///    [`path`](RouterDerived::path) and [`route`](RouterDerived::route). Use
+///    the `*_recursive` variants when a node routes into *its own type* (e.g. a
+///    directory whose children are also directories): the recursion is erased
+///    behind a boxed future, which would otherwise be an infinitely-sized type
+///    that fails to compile.
+/// 3. **Leaves** — consulted only when the path is exhausted. A leaf is the
+///    terminal of a route: it is selected by HTTP [`Method`] and produces the
+///    final [`Response`]. See [`get`](RouterDerived::get),
+///    [`post`](RouterDerived::post), [`any_leaf`](RouterDerived::any_leaf),
+///    etc.
+///
+/// If no route matches a remaining segment the router replies `404`. If the
+/// path is exhausted but no leaf matches the request method, the router
+/// replies `405` when some *other* method would have matched, and `404`
+/// otherwise.
+///
+/// # Composition
+///
+/// `MakeRoute` is implemented for several standard types so that a node can be
+/// produced fallibly or conditionally and still plug into the tree:
+///
+/// - [`Result<T, E>`] — `Ok(node)` routes into `node`; `Err(e)` short-circuits
+///   the request with `e` (where `E: Response`). This lets a node bail out with
+///   an error response from anywhere.
+/// - [`Option<T>`] — `Some(node)` routes into `node`; `None` replies `404`.
+/// - [`Either<T1, T2>`] — registers both alternatives; the active variant
+///   drives routing. Useful when two branches produce different node types.
+/// - `()` — an empty node that matches nothing.
+/// - [`ShortCircuit<T>`] — replies with `T` for any remaining path and method.
 pub trait MakeRoute<B = Incoming>: Sized {
+    /// Declare this node's middleware, routes, and leaves on `router`.
+    ///
+    /// The router calls this once per phase as it resolves a request (see the
+    /// [trait documentation](MakeRoute) for the phase order), so `register`
+    /// must be deterministic: it should make the same set of declarations on
+    /// every call rather than depend on external state. The `Self` value for
+    /// the node is threaded to you through the [`Router`] callbacks, not
+    /// through `&self` — `register` is an associated function.
     fn register<R: Router<Self, B>>(router: &mut R) -> impl Future<Output = ()>;
 }
+/// `None` replies `404`; `Some(node)` routes into `node`.
 impl<B, T> MakeRoute<B> for Option<T>
 where
     T: MakeRoute<B>,
@@ -770,8 +974,17 @@ where
     }
 }
 
+/// The outcome of a match test, carrying ownership of the node either way.
+///
+/// Routing tests take the node by value because a match needs to transform it
+/// (often into a different type) while a miss needs to hand it back unchanged
+/// so the next declaration can try. `Then(u)` means "matched — here is the
+/// transformed state `u`"; `Else(t)` means "did not match — here is the
+/// original node `t`".
 pub enum Then<U, T> {
+    /// The test matched, yielding the transformed state.
     Then(U),
+    /// The test did not match, returning the node unchanged.
     Else(T),
 }
 impl<U, T> Then<U, T> {
@@ -806,6 +1019,8 @@ impl<U, T> Then<U, T> {
     }
 }
 
+/// `Err(e)` short-circuits with `e` as the response; `Ok(node)` routes into
+/// `node`.
 impl<B, T, E> MakeRoute<B> for Result<T, E>
 where
     T: MakeRoute<B>,
@@ -917,6 +1132,8 @@ where
         }
     }
 }
+/// Registers both alternatives; the variant the node currently holds drives
+/// routing. Lets a single declaration site produce two different node types.
 impl<B, T1, T2> MakeRoute<B> for Either<T1, T2>
 where
     T1: MakeRoute<B>,
@@ -1044,10 +1261,16 @@ where
         }
     }
 }
+/// An empty node: declares nothing, so it matches no route or leaf.
 impl<B> MakeRoute<B> for () {
     async fn register<R: Router<Self, B>>(_router: &mut R) {}
 }
 
+/// A node that replies with `T` for any remaining path and any method.
+///
+/// Used to terminate routing unconditionally — e.g. to serve a fixed error or
+/// to act as a catch-all. It is the mechanism behind the
+/// [`Result`]/[`Option`] short-circuits.
 pub struct ShortCircuit<T>(pub T);
 impl<B, T> MakeRoute<B> for ShortCircuit<T>
 where

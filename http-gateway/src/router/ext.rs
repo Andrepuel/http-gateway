@@ -7,7 +7,26 @@ use crate::{
 use hyper::{Method, StatusCode, body::Incoming};
 
 impl<T, S> RouterExt<T> for S where S: Router<T, Incoming> + RouterDerived<T, Incoming> {}
+/// Higher-level, JSON-oriented routing helpers for real HTTP requests.
+///
+/// Where [`Router`] and [`RouterDerived`] are body-agnostic, these helpers are
+/// fixed to the [`Incoming`] body so they can read and deserialize request
+/// payloads. The trait is blanket-implemented for every such router, so its
+/// methods are available on the `router` passed to [`MakeRoute::register`]. On
+/// top of the routing primitives it adds JSON body deserialization
+/// ([`deserialize`](Self::deserialize), [`leaf_body`](Self::leaf_body), …),
+/// read/write attribute endpoints ([`setter`](Self::setter),
+/// [`attribute`](Self::attribute)), and transactional middleware
+/// ([`transaction`](Self::transaction)).
 pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
+    /// Middleware that, when `if_` matches, reads the entire request body,
+    /// deserializes it from JSON into `B`, and routes into the node returned by
+    /// `f`.
+    ///
+    /// A transport error while collecting the body, or a JSON parse failure,
+    /// short-circuits the request with `400 Bad Request` carrying the cause as
+    /// a JSON `{ "error": ... }` body. Because it consumes the body, use it only
+    /// for endpoints that expect a payload.
     async fn deserialize_if<B, I, F, U>(&mut self, if_: I, f: F)
     where
         B: serde::de::DeserializeOwned,
@@ -33,6 +52,8 @@ pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
         .await
     }
 
+    /// [`deserialize_if`](Self::deserialize_if) restricted to `POST` and `PUT`
+    /// requests — the methods that conventionally carry a body.
     async fn deserialize<B, F, U>(&mut self, f: F)
     where
         B: serde::de::DeserializeOwned,
@@ -46,6 +67,13 @@ pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
         .await
     }
 
+    /// Terminal handler that deserializes the JSON request body into `B` and
+    /// invokes `f(node, body, request)` to produce the [`Response`], for
+    /// requests with the given `method`.
+    ///
+    /// This is the body-aware counterpart to [`leaf`](RouterDerived::leaf): the
+    /// payload is parsed up front and passed to `f` alongside the still-readable
+    /// [`Request`]. A malformed body yields `400 Bad Request`.
     async fn leaf_body<F, B, U>(&mut self, method: Method, f: F)
     where
         B: serde::de::DeserializeOwned,
@@ -77,6 +105,7 @@ pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
         }
     }
 
+    /// [`leaf_body`](Self::leaf_body) fixed to [`Method::POST`].
     async fn post_body<F, B, U>(&mut self, f: F)
     where
         B: serde::de::DeserializeOwned,
@@ -86,6 +115,7 @@ pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
         self.leaf_body::<F, B, U>(Method::POST, f).await
     }
 
+    /// [`leaf_body`](Self::leaf_body) fixed to [`Method::PUT`].
     async fn put_body<F, B, U>(&mut self, f: F)
     where
         B: serde::de::DeserializeOwned,
@@ -95,6 +125,12 @@ pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
         self.leaf_body::<F, B, U>(Method::PUT, f).await
     }
 
+    /// Declares a `PUT` endpoint at the path segment `name` that deserializes
+    /// the JSON body into `B` and hands it to `set`.
+    ///
+    /// `set` returning `Ok(())` replies `200 OK` with an empty body; `Err(e)`
+    /// replies with `e`. This is the write half of an
+    /// [`attribute`](Self::attribute).
     async fn setter<B, E, P, S>(&mut self, name: P, set: S)
     where
         B: serde::de::DeserializeOwned,
@@ -143,6 +179,12 @@ pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
         }
     }
 
+    /// Declares a readable and writable attribute at the path segment `name`.
+    ///
+    /// `GET name` replies with `get(node)` serialized as JSON; `PUT name`
+    /// deserializes the JSON body and applies it with `set` (see
+    /// [`setter`](Self::setter)). Both halves share the same `name` and report
+    /// failure via the [`Response`] error type `E`.
     async fn attribute<E, B, P, S, G>(&mut self, name: P, set: S, get: G)
     where
         E: Response,
@@ -160,6 +202,24 @@ pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
         self.setter(name, set).await;
     }
 
+    /// Wraps the subtree below this node in a transaction whose outcome follows
+    /// the response.
+    ///
+    /// The four callbacks form the transaction lifecycle:
+    ///
+    /// - `begin` derives a transaction handle `D` from the node; if it fails
+    ///   the request short-circuits with the error and the rest is skipped.
+    /// - `route` produces the child [`MakeRoute`] to descend into, borrowing
+    ///   the handle mutably so the routed work can use the transaction.
+    /// - `commit` runs once the downstream [`RouterResponse`] is successful
+    ///   ([`is_success`](RouterResponse::is_success)); if the commit itself
+    ///   fails its error replaces the response.
+    /// - `rollback` runs instead whenever the response is not successful, and
+    ///   the original response is preserved.
+    ///
+    /// In other words the transaction commits on a 2xx and rolls back on
+    /// anything else, so handlers control the outcome simply by the status they
+    /// return.
     async fn transaction<'a, B, F, U, C, R, D, E>(
         &mut self,
         begin: B,
@@ -167,16 +227,19 @@ pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
         commit: C,
         rollback: R,
     ) where
-        B: AsyncFnOnce(T) -> Result<D, E>,
-        F: AsyncFnOnce(&'a mut D) -> U + 'a,
+        B: AsyncFnOnce(&mut T) -> Result<D, E>,
+        F: AsyncFnOnce(T, &'a mut D) -> U + 'a,
         U: MakeRoute<Incoming> + 'a,
         C: AsyncFnOnce(D) -> Result<(), E> + 'a,
         R: AsyncFnOnce(D) + 'a,
         E: Response,
+        T: 'a,
         D: 'a,
     {
-        self.middleware(async move |self_, _| {
-            begin(self_).await.map(|trans| Transaction {
+        self.middleware(async move |mut self_, _| {
+            let trans = begin(&mut self_).await;
+            trans.map(|trans| Transaction {
+                self_: Some(self_),
                 route: Some(route),
                 trans,
                 commit,
@@ -186,27 +249,35 @@ pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
         })
         .await;
 
-        struct Transaction<'a, F, D, C, R> {
+        struct Transaction<'a, T, F, D, C, R> {
+            self_: Option<T>,
             route: Option<F>,
             trans: D,
             commit: C,
             rollback: R,
             marker: std::marker::PhantomData<fn(&'a ())>,
         }
-        impl<'a, F, U, D, C, R, E> MakeRoute<Incoming> for Transaction<'a, F, D, C, R>
+        impl<'a, T, F, U, D, C, R, E> MakeRoute<Incoming> for Transaction<'a, T, F, D, C, R>
         where
-            F: AsyncFnOnce(&'a mut D) -> U + 'a,
+            F: AsyncFnOnce(T, &'a mut D) -> U + 'a,
             U: MakeRoute<Incoming> + 'a,
             C: AsyncFnOnce(D) -> Result<(), E> + 'a,
             R: AsyncFnOnce(D) + 'a,
             E: Response,
+            T: 'a,
             D: 'a,
         {
             async fn register<Ro: Router<Self, Incoming>>(router: &mut Ro) {
                 router
                     .middleware_mut_map(
                         |self_, _| Then::Then(self_),
-                        async |self_, _| (self_.route.take().unwrap())(&mut self_.trans).await,
+                        async |self_, _| {
+                            (self_.route.take().unwrap())(
+                                self_.self_.take().unwrap(),
+                                &mut self_.trans,
+                            )
+                            .await
+                        },
                         async |self_, res| match res.is_success() {
                             true => match (self_.commit)(self_.trans).await {
                                 Ok(()) => res,
@@ -224,6 +295,8 @@ pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
     }
 }
 
+/// `400 Bad Request` response produced when a request body cannot be read or
+/// JSON-deserialized, rendered as a JSON `{ "error": ... }` body.
 #[derive(serde::Serialize)]
 struct SerdeError {
     error: String,
