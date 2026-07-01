@@ -81,7 +81,7 @@ pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
         U: Response,
     {
         self.deserialize_if::<B, _, _, _>(
-            |_, req| req.method == method,
+            |_, req| req.method == method && req.path.is_empty(),
             async |self_, body| BodyRoute(self_, body, f),
         )
         .await;
@@ -141,7 +141,7 @@ pub trait RouterExt<T>: Router<T, Incoming> + RouterDerived<T, Incoming> {
         let name = name.into();
 
         self.route_if(
-            |_, req, path| req.method == Method::PUT && path == &name,
+            |_, req, path| req.method == Method::PUT && path == &name && req.path.is_empty(),
             async |self_, _, _| Body(self_, set, Default::default()),
         )
         .await;
